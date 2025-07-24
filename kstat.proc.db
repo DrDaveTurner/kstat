@@ -1,0 +1,544 @@
+#!/usr/bin/env perl
+
+# kstat is being developed by Dave Turner at Kansas State University
+# Fall 2014 - current  Email: DrDaveTurner@gmail.com
+# This is free software distributed under the GPLv3 license
+
+# perl DBI version storing data in a PostgreSQL database every minute
+
+# kstat.proc.db runs in a continuous loop inserting data into the
+#    database then sleeping for 60 seconds on each compute node to
+#    gather information from the /proc system on memory, IO, and network
+#    usage for the host and each job.  This information is put into
+#    the kstat_info PostgreSQL database where kstat.db will use it.
+
+    ########################## CONFIGURATION ################################
+    ########################## CONFIGURATION ################################
+        # Edit to configure paths for your cluster computing system
+
+# Installation path
+#$installation_path = "/homes/daveturner/bin";
+
+# Slurm base path for slurm.conf and topology.conf files
+$slurm_path = "/etc/slurm";
+
+# SuperComputer name and optional computing center name
+#$system_name = "Beocat";
+#$center_name = "K-State";
+
+# Path to Perl library with PostgreSQL DB installed and DB host system
+$perl_lib = "/homes/daveturner/.perl5/lib/perl5/site_perl/5.34.1";
+$db_host = "ganymede.beocat.ksu.edu";
+
+# Open Science Grid user name on this system if any, or put "none"
+#$osg_user_name = "none";
+#$show_osg_jobs = "no";
+
+    ########################## END CONFIGURATION ################################
+    ########################## END CONFIGURATION ################################
+
+no strict 'vars';   # Yell all you want, it's a preference thing.
+use Time::Piece;
+use Time::Seconds;
+use lib $perl_lib;
+use DBI;
+
+   # Determine what OS we are on, tested on CentOS and Rocky
+
+$ostype = "";
+while ( $ostype eq "" ) {
+
+   if ( -d "/sys/fs/cgroup/system.slice/slurmstepd.scope" ) {
+      $ostype = "Rocky";
+   } elsif ( -d "/sys/fs/cgroup/cpuset/slurm/" ) {
+      $ostype = "CentOS";
+   } else {
+      printf "ERROR: Could not determine the OS type, not CentOS or Rocky\n";
+      sleep( 60 - `date '+%S'`);   # Sleep until the top of the minute
+   }
+
+}
+
+$sconfile = "/opt/beocat/kstat-nodeinfo/kstat.scontrol.show.nodes";
+
+   # Connect to the kstat_info PostgreSQL database
+
+$dbh = DBI->connect("dbi:Pg:dbname=kstat_info;host=$db_host",'kstat','rigid-headway-fountain',{AutoCommit=>1,RaiseError=>1,PrintError=>0});
+
+
+   # Get the node_id for my hostname if there is one in the database already
+
+$nodename = `hostname`;
+chomp($nodename);
+
+$node_id = "";
+$sth = $dbh->prepare("SELECT node_id FROM nodes WHERE node_name=\'$nodename\'");
+$sth->execute() or die $DBI::errstr;
+while( @row = $sth->fetchrow_array ) {   # Catch 2 rows
+   $node_id = $row[0];
+}
+$sth->finish();
+
+   # Get the owners for each node
+
+printf "\n\nKSTAT RESTARTING on $nodename with node_id |$node_id| to start\n\n";
+foreach $line ( `cat $slurm_path/slurm.conf` ) { # Asign owners to nodes
+   chomp( $line );
+   next if $line =~ "PartitionName=osg.q";
+   next if $line =~ "PartitionName=batch.q";
+   next if $line =~ "PartitionName=killable.q";
+
+   if ( $line =~ "PartitionName=" ) {
+      $line =~ /PartitionName=([\-\.\_\w]+) /;
+      $partitionname = $1;
+      $line =~ /Nodes=([,\w\_\-\.]+)/;
+      @nodes = split(',', $1 );
+      foreach $node ( @nodes ) {
+         $owner{$node} = $partitionname;
+      }
+   }
+}
+
+   # Find my hosts info in the slurm.conf file and process
+
+foreach $line ( `cat $slurm_path/slurm.conf` ) {
+   chomp( $line );
+
+   if ( $line =~ "NodeName=$nodename" ) {
+      $gpu_type = "nogpu";
+      $ngpus = 0;
+      if ( $owner{$nodename} eq "" ) {
+         $owner{$nodename} = "unowned";
+      }
+      if ( $line =~ /CPUs=(\d+) / ) {
+         $cpus = $1;
+      }
+      if ( $line =~ /RealMemory=(\d+) / ) {
+         $memory = $1;
+      }
+      if ( $line =~ /TmpDisk=(\d+) / ) {
+         $tmp = $1;
+      }
+      if ( $line =~ /gpu:([\w_-\d]+):(\d+)/ ) {
+         $gpu_type = $1;
+         $ngpus = $2;
+      }
+      $timepiece = Time::Piece->new;
+      $datetime = $timepiece->datetime;
+
+      if(  $node_id eq "" ) {   # New node so do an INSERT
+
+         printf "INSERT nodes table $nodename $cpus $memory $owner{$nodename} $ngpus $gpu_type $tmp $datetime\n";
+
+         $sth = $dbh->prepare("INSERT INTO nodes (node_name, total_cores, total_mem, owner, gpu_count, local_disk, last_scanned ) values ( \'$nodename\', \'$cpus\', \'$memory\', \'$owner{$nodename}\', \'$ngpus\', \'$tmp\', \'$datetime\' )");
+         $sth->execute() or die $DBI::errstr;
+         $sth->finish();
+
+            # Now grab the new node_id
+
+         $sth = $dbh->prepare("SELECT node_id FROM nodes WHERE node_name=\'$nodename\'");
+         $sth->execute() or die $DBI::errstr;
+         @row = $sth->fetchrow_array;
+         $node_id = $row[0];
+         $sth->finish();
+
+      } else {   # Old node so update instead
+
+         printf "UPDATE nodes table $node_id $nodename $cpus $memory $owner{$nodename} $ngpus $gpu_type $tmp $datetime\n";
+
+         $sth = $dbh->prepare("UPDATE nodes SET node_name = \'$nodename\', total_cores = \'$cpus\', total_mem = \'$memory\', owner = \'$owner{$nodename}\', gpu_count = \'$ngpus\', local_disk = \'$tmp\', last_scanned = \'$datetime\' WHERE  node_id = \'$node_id\'");
+         $sth->execute() or die $DBI::errstr;
+         $sth->finish();
+
+      }
+
+         # Get GPU information for this host
+
+      $num_gpus = 0;
+      if( `/usr/sbin/lspci -d 10de:` ) {
+         foreach $gpu ( `nvidia-smi --format=csv,noheader --query-gpu=index,name,memory.total` ) {
+            chomp($gpu);
+
+               # Skip nodes that have no nVidia GPUs
+
+            next if ( $gpu =~ "command not found");
+            next if ( $gpu =~ "has failed" );
+            next if ( $gpu eq "" );
+
+            ($gnum, $gtype, $gmem) = ($gpu =~ /([0-9]+), ([^,]+), ([0-9]+) MiB/);
+            $gpu_mem_total{$gnum} = $gmem;
+            $gpu_type{$gnum} = $gtype;
+            $num_gpus ++;
+         }
+      }
+
+         # Get the current node_gpu_id's for all entries
+
+      $sth = $dbh->prepare("SELECT * FROM node_gpus WHERE node_id = \'$node_id\'");
+      $sth->execute() or die $DBI::errstr;
+      $i = 0;
+      while( @row = $sth->fetchrow_array ) {
+         $node_gpu_id{$i} = $row[0];
+         $i ++;
+      }
+      $old_ngpus = $i;
+      $sth->finish();
+
+      printf "\nUPDATING node_gpus table, had $old_ngpus GPUs and now $num_gpus GPUs\n\n";
+
+      $maxgpus = ($old_ngpus > $num_gpus ? $old_ngpus : $num_gpus);
+      for ( $i = 0; $i < $maxgpus; $i++ ) {
+         if ($gpu_mem_total{$i} !~ /^\d+$/) { $gpu_mem_total{$i} = 0 };
+
+         if ( $i < $old_ngpus and $i < $num_gpus ) {   # UPDATE the old with the new
+
+            printf "UPDATE node_gpus $nodename $node_gpu_id{$i} $node_id $i $gpu_type{$i} $gpu_mem_total{$i}\n";
+
+            $sth = $dbh->prepare("UPDATE node_gpus SET gpu_num = \'$i\', gpu_name = \'$gpu_type{$i}\', gpu_total_mem = \'$gpu_mem_total{$i}\' WHERE node_id = \'$node_id\' and node_gpu_id = \'$node_gpu_id{$i}\'");
+            $sth->execute() or die $DBI::errstr;
+            $sth->finish();
+
+         } elsif ( $i >= $old_ngpus and $i < $num_gpus ) { # INSERT a new GPU entry
+
+            printf "INSERT node_gpus $nodename $node_id $i $gpu_type{$i} $gpu_mem_total{$i}\n";
+
+            $sth = $dbh->prepare("INSERT INTO node_gpus (node_id, gpu_name, gpu_num, gpu_total_mem ) values ( \'$node_id\', \'$gpu_type{$i}\', \'$i\', \'$gpu_mem_total{$i}\' )");
+            $sth->execute() or die $DBI::errstr;
+            $sth->finish();
+
+         } elsif ( $i < $old_ngpus and $i >= $num_gpus ) { # UPDATE an old entry to strand it
+
+            printf "UPDATE to strand node_gpus $nodename $node_gpu_id{$i} $node_id $i\n";
+
+            $sth = $dbh->prepare("UPDATE node_gpus SET gpu_num = \'-1\' WHERE node_id = \'$node_id\' and node_gpu_id = \'$node_gpu_id{$i}\'");
+            $sth->execute() or die $DBI::errstr;
+            $sth->finish();
+
+         }
+
+      }
+      printf "\n";
+   }
+}
+
+
+   # Start the infinite loop, sleep until top of the minute at the end
+
+$prevdate = "None";
+while(1) {
+
+   $timepiece = Time::Piece->new;
+   $datetime = $timepiece->datetime;
+   $date = $timepiece->date;
+   #$time = $timepiece->hms;
+   $tminusone = $timepiece - ONE_HOUR;
+   $dateminushour = $tminusone->date;
+   #$date = `date +%FT%T`;
+   #chomp($date);
+
+   $pidlist = "";
+   $jidlist = "";
+   foreach $dir ( `ls -l /proc | grep -v " root "` ) {    # This is more general
+      chomp($dir);
+
+      $pid = ( split( ' ', $dir ) )[8];    # Grab the PID off the end
+
+      if( -e "/proc/$pid/cgroup" ) {
+         $line = `cat /proc/$pid/cgroup | grep job_ | head -1`;
+         ($jid) = ( $line =~ /job_(\d+)/ );
+         $u = "";
+         if ( $ostype eq "CentOS" ) {     # For CentOS get UIDs and jids
+            ($u) = ( $line =~ /uid_(\d+)/ );
+         }
+
+         if( $jid ) {        # Add this to the list of pids for this job
+            $uid{$jid} = $u;
+            $pidlist .= "$pid ";
+            $jobid{$pid} = $jid;
+            if( $jidlist !~ $jid ) { $jidlist .= "$jid "; }
+         }
+      }
+   }
+
+   #printf "Job metrics table\n";
+
+   $host_mem_used = 0;
+   foreach $jid ( split( ' ', $jidlist ) ) {
+
+      if ( $ostype eq "Rocky" ) {
+         $scpuset = "/sys/fs/cgroup/system.slice/slurmstepd.scope/job_$jid";
+         $smem = "/sys/fs/cgroup/system.slice/slurmstepd.scope/job_$jid";
+         $jobmem = `cat $smem/memory.current`;
+         $maxmem = `cat $smem/memory.peak`;
+         $swapmem = `cat $smem/memory.swap.current`;
+         $swapmax = `cat $smem/memory.swap.max`;   # DDT - not reliable
+      } elsif ( $ostype eq "CentOS" ) {
+         $scpuset = "/sys/fs/cgroup/cpuset/slurm/uid_$uid{$jid}/job_$jid";
+         $smem = "/sys/fs/cgroup/memory/slurm/uid_$uid{$jid}/job_$jid";
+         $jobmem = `cat $smem/memory.usage_in_bytes`;
+         $maxmem = `cat $smem/memory.max_usage_in_bytes`;
+         $swapmem = `cat $smem/memory.memsw.usage_in_bytes`;
+         $swapmem -= $jobmem;  # I think this is correct
+         $swapmax = `cat $smem/memory.memsw.max_usage_in_bytes`;
+         $swapmax -= $maxmem;  # I think this is correct
+      }
+
+      $jobmem /= (1024*1024*1024);
+      $host_mem_used += $jobmem;
+      $maxmem /= (1024*1024*1024);
+      $swapmem /= (1024*1024*1024);
+      $swapmax /= (1024*1024*1024);
+
+      $cpu_user = 0;
+      $cpu_sys  = 0;
+      $cpu_idle = 0;
+      $cpu_io   = 0;
+
+         # Grab the cpuset from Slurm and process
+
+      $slurm_cpuset = `cat $scpuset/cpuset.cpus`;
+      chomp( $slurm_cpuset );
+      %seen = ();
+      @cpuset_list =
+         sort { $a <=> $b }
+         grep { !$seen{$_}++ }
+         map {
+            @r = split /-/;
+            @r>1 ? ($r[0] .. $r[1]) : @r;
+         }
+         split /,/, $slurm_cpuset;
+      $ncores = scalar @cpuset_list;
+
+      #printf "ncores |$ncores|  slurm cpuset |$slurm_cpuset|  list |@cpuset_list|\n";
+
+      foreach $core ( @cpuset_list ) {
+         $cpunum = $core;
+         @cpu = split(' ', $cpuline[$cpunum+1]);
+         $cpu_user += $cpu[1];
+         $cpu_sys  += $cpu[3];
+         $cpu_idle += $cpu[4];
+         $cpu_io   += $cpu[5];
+      }
+
+      printf "INSERT JOB $jid $node_id $ncores $cpu_user $cpu_sys $cpu_idle $cpu_io $jobmem $maxmem $swapmem $swapmax $datetime\n";
+
+      $sth = $dbh->prepare("INSERT INTO job_metrics ( node_id, job_id, job_ncores, cpu_user, cpu_system, cpu_idle, cpu_io, mem_used, max_mem_used, swap_mem_used, max_swap_mem_used, time_stamp ) values ( \'$node_id\', \'$jid\', \'$ncores\', \'$cpu_user\', \'$cpu_sys\', \'$cpu_idle\', \'$cpu_io\', \'$jobmem\', \'$maxmem\', \'$swapmem\', \'$swapmax\', \'$datetime\' )");
+      $sth->execute() or die $DBI::errstr;
+      $sth->finish();
+   }
+
+      # DDT - Get scontrol info from the file the master created
+
+   $coresalloc = -1;
+   $ncores = -1;
+   $load = -1;
+   $mem_alloc = -1;
+   $scnode = "";
+
+   if ( -r $sconfile ) {
+
+      foreach $line ( `cat $sconfile` ) {
+
+         if( $line =~ "NodeName=" ) {
+            ($scnode) = ($line =~ /NodeName=(\w+)/);
+         }
+
+         if( $scnode =~ $nodename and $line =~ "CPUAlloc" ) {
+            ($coresalloc)  = ($line =~ /CPUAlloc=(\d+)/);
+            ($ncores)  = ($line =~ /CPUTot=(\d+)/);
+            ($load) = ($line =~ /CPULoad=([.0-9]+)/);
+         }
+
+         if( $scnode =~ $nodename and $line =~ "RealMemory" ) {
+            #($mem_total) = ($line =~ /RealMemory=(\d+)/);
+            ($mem_alloc) = ($line =~ /AllocMem=(\d+)/);
+            #($mem_free)  = ($line =~ /FreeMem=(\d+)/);    # Need mem_avail instead
+            last;
+         }
+
+      }
+
+   } else {
+      printf "ERROR - Could not open $sconfile";
+   }
+
+      # Use scontrol to get host stats
+
+   #foreach $line ( `scontrol show nodes $nodename` ) {
+
+      #if( $line =~ "CPUAlloc" ) {
+         #($coresalloc)  = ($line =~ /CPUAlloc=(\d+)/);
+         #($ncores)  = ($line =~ /CPUTot=(\d+)/);
+         #($load) = ($line =~ /CPULoad=([.0-9]+)/);
+      #}
+
+      #if( $line =~ "RealMemory" ) {
+         #($mem_total) = ($line =~ /RealMemory=(\d+)/);
+         #($mem_alloc) = ($line =~ /AllocMem=(\d+)/);
+         #($mem_free)  = ($line =~ /FreeMem=(\d+)/);    # Need mem_avail instead
+      #}
+   #}
+   #$mem_used = $mem_total - $mem_free;
+   $mem_alloc /= 1024.0;
+
+   #foreach $line ( `head -3 /proc/meminfo` ) {
+      #chomp( $line );
+
+      #if     ( $line =~ "MemTotal"     ) {
+         #$mem_total  = (split(' ', $line))[1];  # Pull off the number of kB
+         #$mem_total /= (1024*1000);                # Convert to GB
+      #} elsif( $line =~ "MemFree"      ) {
+         #$mem_free   = (split(' ', $line))[1];  # Pull off the number of kB
+         #$mem_free  /= (1024*1000);                # Convert to GB
+      #} elsif( $line =~ "MemAvailable" ) {
+         #$mem_avail  = (split(' ', $line))[1];  # Pull off the number of kB
+         #$mem_avail /= (1024*1000);                # Convert to GB
+      #}
+   #}
+   #$mem_used = $mem_total - $mem_avail;  # Doesn't quite add up right???
+
+      # Get the host CPU usage for now and save the core usages for later
+
+   $lines = `grep "cpu" /proc/stat`;   # Grab all CPU lines
+   @cpuline = split("\n",$lines);      # First line is sums, then each indiv CPU
+
+   @cpu     = split(' ', $cpuline[0]);  # Host CPU utilizations
+   $cpu_user = $cpu[1];
+   $cpu_sys  = $cpu[3];
+   $cpu_idle = $cpu[4];
+   $cpu_io   = $cpu[5];
+
+      # Fill in the host metrics for this node
+
+   #printf "Host metrics table\n";
+   printf "INSERT HOST $nodename  $node_id $coresalloc $load $cpu_user $cpu_sys $cpu_idle $cpu_io $host_mem_used $mem_alloc $datetime\n";
+
+   $sth = $dbh->prepare("INSERT INTO node_metrics ( node_id, time_stamp, cores_used, cpu_load, cpu_user, cpu_system, cpu_idle, cpu_io, mem_used, mem_alloc ) values ( \'$node_id\', \'$datetime\', \'$coresalloc\', \'$load\', \'$cpu_user\', \'$cpu_sys\', \'$cpu_idle\', \'$cpu_io\', \'$host_mem_used\',\'$mem_alloc\')");
+
+   $sth->execute() or die $DBI::errstr;
+   $sth->finish();
+
+      # Grab the GPU data from nvidia-smi and parse
+
+   #printf "GPU metrics table\n";
+
+   if( `/usr/sbin/lspci -d 10de:` ) {
+      foreach $gpu ( `nvidia-smi --format=csv,noheader --query-gpu=index,name,utilization.gpu,memory.used,memory.total,utilization.memory` ) {
+         chomp($gpu);
+
+            # Skip nodes that have no nVidia GPUs
+
+         next if ( $gpu =~ "command not found");
+         next if ( $gpu =~ "has failed" );
+         next if ( $gpu eq "" );
+
+         ($gpu_num, $gpu_type, $gpu_util, $gpu_mem_used, $gpu_mem_total) = 
+               ($gpu =~ /([0-9]+), ([^,]+), ([0-9]+) %, ([0-9]+) MiB, ([0-9]+) MiB/);
+
+         $gpu_type =~ s/ /_/g;
+
+            # Get the PID for each GPU to get the Slurm Job ID number
+               # The program name is available here too (Name : prog)
+
+# DDT - BUG - If the GPU is allocated but not used, there will be no PID and
+#      utilization will not be counted as 0.
+
+         $line = `nvidia-smi -q -i $gpu_num -d PIDS | grep 'Process ID'`;
+         ($pid) = ($line =~ /Process ID +: +([0-9]+)/);
+         if ( $pid ne "" ) {
+            $line = `cat /proc/$pid/cgroup | grep job_ | head -1`;
+            ($jid) = ( $line =~ /job_(\d+)/ );
+         }
+
+         if ( $pid ne "" and $jid ne "" ) {  # Insert data into job_gpu_metrics
+
+            $sth = $dbh->prepare("SELECT node_gpu_id FROM node_gpus WHERE node_id=\'$node_id\' and gpu_num=\'$gpu_num\'");
+            $sth->execute() or die $DBI::errstr;
+            @row = $sth->fetchrow_array;
+            $node_gpu_id = $row[0];
+            $sth->finish();
+
+            printf "INSERT GPU $node_gpu_id $jid $datetime $gpu_util $gpu_mem_used\n";
+
+            $sth = $dbh->prepare("INSERT INTO job_gpu_metrics (node_id, node_gpu_id, job_id, time_stamp, gpu_utilization, gpu_mem_used ) values ( \'$node_id\', \'$node_gpu_id\', \'$jid\', \'$datetime\', \'$gpu_util\', \'$gpu_mem_used\' )");
+            $sth->execute() or die $DBI::errstr;
+            $sth->finish();
+         }
+      }
+   }
+
+      # If new day and not first entry, sum and condense prev day's node_metrics
+
+   if ( $date ne $prevdate and $dateminushour eq $date  ) { # 1 hour into next day
+      $prevdatetime = $timepiece - ONE_DAY;
+      $prevdate = $prevdatetime->date;
+      $prevdatestr = "$prevdate";
+      printf "\n$datetime ==> CONDENSING PREVIOUS DAY'S ($prevdatestr) NODE_METRICS DATA\n";
+
+      $sth = $dbh->prepare("SELECT * FROM node_metrics WHERE node_id=\'$node_id\' and TO_CHAR( time_stamp, 'YYYY-MM-DD HH:MM:SS' ) LIKE \'%${prevdatestr}%\' ORDER BY time_stamp ASC");
+      $sth->execute() or die $DBI::errstr;
+
+      $#lastrow = -1;
+      $#firstrow = -1;
+      $nrows = 0;
+      $coresalloc = 0;
+      $load = 0;
+      $mem_used = 0;
+      $mem_alloc = 0;
+      while( @row = $sth->fetchrow_array ) {   # Catch 2 rows
+         $nrows ++;
+         if( $nrows == 1 ) {
+            @firstrow = @row;
+            $node_metrics_date = Time::Piece->strptime( $row[2], '%Y-%m-%d %H:%M:%S' );
+         } else {
+            @lastrow = @row;
+         }
+         $coresalloc += $row[3];
+         $load += $row[4];    # comes from scontrol
+         $mem_used   += int(0.5+$row[9]);    # Slurm total - avail
+         $mem_alloc += int(0.5+$row[10]);    # Slurm allocated
+      }
+      $sth->finish();
+
+      if ( $nrows >= 2 ) {   # Condense
+         $coresalloc = int( 0.5 + ($coresalloc / $nrows) );
+         $load /= $nrows;
+         $mem_used /= $nrows;
+         $mem_alloc /= $nrows;
+         $cpu_user = $lastrow[5] - $firstrow[5];
+         $cpu_sys  = $lastrow[6] - $firstrow[6];
+         $cpu_idle = $lastrow[7] - $firstrow[7];
+         $cpu_wait = $lastrow[8] - $firstrow[8];
+
+         printf "DELETING $nrows lines for $prevdate\n";
+
+         $sth = $dbh->prepare("DELETE FROM node_metrics WHERE node_id=\'$node_id\' and TO_CHAR( time_stamp, 'YYYY-MM-DD HH:MM:SS' ) LIKE \'%${prevdatestr}%\'");
+         $sth->execute() or die $DBI::errstr;
+
+         printf "INSERT HOST summation line $nodename  $node_id $coresalloc $load $cpu_user $cpu_sys $cpu_idle $cpu_io $mem_used $mem_alloc $prevdatetime\n\n";
+
+         $sth = $dbh->prepare("INSERT INTO node_metrics ( node_id, time_stamp, cores_used, cpu_load, cpu_user, cpu_system, cpu_idle, cpu_io, mem_used, mem_alloc ) values ( \'$node_id\', \'$prevdatetime\', \'$coresalloc\', \'$load\', \'$cpu_user\', \'$cpu_sys\', \'$cpu_idle\', \'$cpu_wait', \'$mem_used\',\'$mem_alloc\')");
+         $sth->execute() or die $DBI::errstr;
+         $sth->finish();
+      } else {
+         printf "Only $nrows entries so no condensing done\n\n";
+      }
+
+      $prevdate = $date;
+   }
+
+      # DDT - Temp workaround, master node Wizard23 will do scontrol for all
+      #       at the 30 second mark.  All nodes will read at the top of the minute.
+
+   if ( $nodename =~ "wizard23" ) {
+      sleep( 30 - `date '+%S'`);   # Sleep until the half minute
+      `scontrol show nodes > $sconfile.new`;
+      `mv $sconfile.new $sconfile`;
+      printf "MASTER did scontrol for all\n";
+   }
+
+   sleep( 60 - `date '+%S'`);   # Sleep until the top of the minute
+}
+
+$dbh->disconnect();
+

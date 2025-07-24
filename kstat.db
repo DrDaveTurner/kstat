@@ -1,0 +1,2291 @@
+#!/usr/bin/env perl
+
+# kstat was developed by Dave Turner at Kansas State University
+# Fall 2014 - present  Email: DrDaveTurner@gmail.com
+# This is free software distributed under the GPL license
+
+# Parse the squeue, sacct, /proc, and nvidia-smi output 
+# to present it in a more useful and colorful manner.
+
+# kstat --help     for a summary of how to use kstat
+# For use outside of KSU you may configure the hostcolor subroutine for your system
+
+
+   # Process the kstat.config file
+
+open( CONFIG, "./kstat.config" )
+   or die "Could not open the ./kstat.config file\n";
+
+foreach $line ( <CONFIG> ) {
+
+   chomp( $line );
+   next if( $line =~ "^ *#" );   # Skip comments with leading '#' sign
+   next if( $line !~ "=" );      # Skip lines without an '=' sign
+
+   if( $line =~ "install_path" ) {
+      ($install_path ) = ($line =~  /^ *install_path *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "slurm_path" ) {
+      ($slurm_path   ) = ($line =~    /^ *slurm_path *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "system_name" ) {
+      ($system_name  ) = ($line =~   /^ *system_name *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "center_name" ) {
+      ($center_name  ) = ($line =~   /^ *center_name *=[ "']*([^#]+)[ "']*/);
+   #} elsif( $line =~ "perl_lib" ) {
+      #($perl_lib     ) = ($line =~      /^ *perl_lib *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "db_name" ) {
+      ($db_name      ) = ($line =~       /^ *db_name *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "db_host" ) {
+      ($db_host      ) = ($line =~       /^ *db_host *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "db_password" ) {
+      ($db_password  ) = ($line =~   /^ *db_password *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "osg_user_name" ) {
+      ($osg_user_name) = ($line =~ /^ *osg_user_name *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "osg_show_jobs" ) {
+      ($osg_show_jobs) = ($line =~ /^ *osg_show_jobs *=[ "']*([^#]+)[ "']*/);
+
+         # Grab owner names for each partition for Condo model
+
+   } elsif( $line =~ "condo" ) {
+      ($partition, $owner_name) = ($line =~ /^ *condo[ "']+([^ =]+)[ "']*=[ "']*([^#]+)[ "']*$/);
+      $hostowner{$partition} = "$owner_name";
+   }
+}
+
+no strict 'vars';  # Yell all you want, it's a preference thing.
+# Perl newer than 5.17.8 should have 256 colors and Time::Piece
+#use lib "/homes/daveturner/kstat/test_install/perl_lib";  # Symbolic link to actual lib
+#use lib $perl_lib;   # Set and export PERL5LIB in the kstat wrapper
+use Time::Piece;
+use Time::Seconds;
+use DBI;
+use Chart::Gnuplot;    # Only needed to support graphs
+
+
+   # Connect to the kstat_info PostgreSQL database
+
+$dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host",'kstat',"$db_password",{AutoCommit=>1,RaiseError=>1,PrintError=>0});
+
+
+if( $ARGV[0] =~ "^usage" || $ARGV[0] =~ "help" ) {
+   printf "USAGE: kstat [-q] [-c] [-g] [-l] [-u user] [-p NaMD] [-j 1234567]\n";
+   printf "       kstat alone dumps all info except for the core summaries\n";
+   printf "       choose -q -c for only specific info on queued or core summaries.\n";
+   printf "       then specify any searchables for the user, program name, or job id\n";
+   printf "\n";
+   printf "kstat                %s info on running and queued jobs    %s\n";
+   printf "kstat -h             %s list host info only, no jobs       %s\n";
+   printf "kstat -q             %s info on the queued jobs only       %s\n";
+   printf "kstat -c             %s core usage for each user           %s\n";
+   printf "kstat -d #           %s show jobs run in the last # days   %s\n";
+   printf "                     %s Memory per node - used/allocated/requested%s\n";
+   printf "                     %s Red is close to or over requested amount\n";
+   printf "                     %s Yellow is under utilized for large jobs\n";
+   printf "kstat -h -l -g all   %s Show all GPU nodes                 %s\n";
+   printf "kstat -h -l -g a4000 %s Show 1 particular type of GPU node %s\n";
+   printf "kstat -h -l -g 20gb  %s Show GPU nodes over min memory in gb%s\n";
+   printf "kstat -o Turner      %s Only show info for a given owner   %s\n";
+   printf "kstat -o CS_HPC      %s    Same but sub _ for spaces       %s\n";
+   printf "kstat -l             %s long list - node features and performance %s\n";
+   printf "                     %s Node hardware and node CPU usage   %s\n";
+   printf "                     %s job nodelist and switchlist        %s\n";
+   printf "                     %s job current and max memory         %s\n";
+   printf "                     %s job CPU utilizations               %s\n";
+   printf "kstat -u daveturner  %s job info for one user only         %s\n";
+   printf "kstat --me           %s job info for my jobs only          %s\n";
+   printf "kstat -j 1234567     %s info on a given job id             %s\n";
+   printf "kstat --osg          %s show OSG background jobs also      %s\n";
+   printf "kstat --nocolor      %s do not use any color               %s\n";
+   printf "kstat --name         %s display full names instead of eIDs %s\n";
+   printf "kstat --nonames      %s sanitize names with User1 etc      %s\n";
+   printf "\n---------------- Graphs and Tables ---------------------------------------\n";
+   printf "Specify graph/table,  CPU or GPU or host, usage or memory, and optional time\n";
+   printf "kstat --graph-cpu-memory #     %s gnuplot CPU memory for job # %s\n";
+   printf "kstat --table-gpu-usage-5min # %s GPU usage table every 5 min for job # %s\n";
+   printf "kstat --table-cpu-60min #      %s CPU usage, memory, swap table every 60 min for job # %s\n";
+   printf "kstat --table-node [nodename]  %s cores, load, CPU usage, memory table for a node%s\n";
+
+   printf "\n--------------------------------------------------------------------------\n";
+   printf "  Multi-node jobs are highlighted in Magenta\n";
+   printf "     kstat -l also provides a node list and switch list\n";
+   printf "     highlighted in Yellow when nodes are spread across multiple switches\n";
+   printf "  Run time is colorized yellow then red for jobs nearing their time limit\n";
+   printf "  Queue time is colorized yellow then red for jobs waiting longer times\n";
+   printf "--------------------------------------------------------------------------\n";
+   exit;
+}
+
+# Input searchables for users, prog names, job ids
+# Chose to print host info, job info, multi-node, pending
+
+$me = `whoami`;
+chomp($me);
+
+while( $ARGV[0] =~ '^-' ) {
+   $param = lc( shift @ARGV );
+
+   if ( $param =~ "-graph|table" ) {
+      $tableparam = $param;
+      $tablejid = shift @ARGV;
+      $tablenodename = $tablejid;
+   
+   } elsif( $param =~ "-me" ){ $susers .= "$me ";
+   } elsif( $param =~ "-ll" ) { $pr_longlist = "longlonglist";
+   } elsif( $param =~ "-l" ) { $pr_longlist = "longlist";
+
+   } elsif( $param =~ "-h" ) { $pr_hosts  = "hosts";
+   } elsif( $param =~ "-c" ) { $pr_cores  = "cores";
+   } elsif( $param =~ "-q" ) { $shosts = "queue ";
+   } elsif( $param =~ "-osg" ) { $osg_show_jobs = "yes";     # Show OSG jobs too
+   } elsif( $param =~ "-o" ) { 
+      $pr_owner = shift @ARGV;
+      $pr_owner =~ s/_/ /g;
+         # Also include Chem MRI nodes for the 5 groups below
+      if( lc($pr_owner) =~ "bin liu" ||
+          lc($pr_owner) =~ "aikens"  ||
+          lc($pr_owner) =~ "smith"   ||
+          lc($pr_owner) =~ "comer"   ||
+          lc($pr_owner) =~ "schmit" ) {
+            $pr_owner_chem_mri = "Chem MRI"
+      } else {
+            $pr_owner_chem_mri = "not part of chem mri"
+      }
+   } elsif( $param =~ "-g" ) {   # Print GPU nodes only, searchable
+      $pr_gpus = lc(shift @ARGV);   # all, GPU type, or min GPU memory in gb
+
+# These must follow the above parameters
+
+   } elsif( $param =~ "-d" ) { $days_ago = shift @ARGV;
+   } elsif( $param =~ "-u" ) { $susers .= (shift @ARGV) . ' ';
+   } elsif( $param =~ "-prog" ) { $sprogs .= lc( shift @ARGV ) . ' ';
+   } elsif( $param =~ "-j" ) { 
+      $jid    = shift @ARGV;
+      ($id)   = ( $jid =~ /(\d+)/ );   # Just the job ID, not the task IDs
+      $sjids .= $id . ',';
+   } elsif( $param =~ "-t" ) { 
+      $id    = shift @ARGV;
+      ($tjid)   = ( $id =~ /(\d+)/ );   # Just the job ID, not the task IDs
+   } elsif( $param =~ "nocolor" ) { $nocolor = "nocolor";
+   } elsif( $param =~ "-name" ) {
+      $pr_names = "full names";
+   } elsif( $param =~ "-noname" ) {
+      $pr_names = "no names";
+   } else {
+      print "The parameter $param is not recognized\n";
+      exit;
+   }
+}
+if( $sjids ) { $sjids = substr( $sjids, 0, -1); }  # Drop the last ','
+
+# Choose all if hosts, runs, or queued jobs not specified
+
+if( $pr_hosts . $pr_runs . $pr_queued eq "" ) {  # Then choose all
+   $pr_hosts = "hosts";
+   $pr_jobs = "jobs";
+   $pr_runs = "runs";
+   $pr_queued = "queued";
+}
+
+# The rest are a list of searchable hosts
+
+while( $#ARGV > -1 ) {
+   $shosts .= lc( shift @ARGV ) . ' ';
+}
+
+   # Set up the colors, including some RGB customs for 256 color xterms
+
+if( $nocolor ) {
+   # Use no colors
+} elsif( `tput colors` == 256 ) {   # Use RGB to fine tune colors for 256-color xterms
+   use Term::ANSIColor qw(:constants :constants256);
+   $gray   = DARK.WHITE;
+   $orange = RGB520.BOLD;
+   $onorange = BLACK.BOLD.ON_RGB520;
+   $brown  = RGB311.BOLD;
+   $blue   = RGB015.BOLD;
+   $onblue = ON_BLUE;
+   $dgreen = RGB020.BOLD;
+   $lgreen = RGB353.BOLD;
+   $onlgreen = BLACK.ON_RGB151.BOLD;
+   $purple = RGB202.BOLD;
+   $pink   = RGB515.BOLD;
+   $lightpink   = RGB513;
+   $magenta = MAGENTA.BOLD;
+   $red     = RGB500.BOLD;
+   $dred    = RGB400.BOLD;
+   $rednorm = RGB500;
+   $green   = GREEN.BOLD;
+   $yellow  = YELLOW.BOLD;
+   $gold    = RGB540.BOLD;
+   $yellownorm  = YELLOW;
+   $onred   = RESET.BOLD.ON_RGB500;
+   $onredblink = RESET.BOLD.ON_RGB500.BLINK;
+   $onyellow = BLACK.BOLD.ON_YELLOW;
+   $onyellowblink = BLACK.BOLD.BLINK.ON_YELLOW;
+   $cyan    = CYAN.BOLD;
+   $bold    = RESET.BOLD;
+   $reset   = RESET;
+} else {                                # For when only 8 colors are supported
+   use Term::ANSIColor qw(:constants);
+   $red = $orange = $onorange = RED.BOLD;
+   $yellownorm = $yellow = $brown  = YELLOW.BOLD;
+   $onblue = ON_BLUE.BOLD;
+   $green = $dgreen = $lgreen = GREEN.BOLD;
+   $magenta = $pink = $purple = MAGENTA.BOLD;
+   $onred   = RESET.BOLD.ON_RED;
+   $onredblink = RESET.BOLD.ON_RED.BLINK;
+   $onyellow = BLACK.BOLD.ON_YELLOW;
+   $gold     = YELLOW.BOLD;
+   $cyan    = CYAN.BOLD;
+   $bold    = RESET.BOLD;
+   $reset   = RESET;
+}
+
+   # System constants
+
+$used_cores = 0;
+$total_cores = 0;
+$nodes_down = 0;
+
+@hostlist = ();
+
+   # Call table and graph routines if requested
+
+if ( $tableparam ) {
+
+   $chart_minutes = 1;
+   if ( $tableparam =~ "-graph" ) {
+      $which_gnuplot = `which gnuplot |& cat -`;
+      if ( $which_gnuplot =~ "no gnuplot" ) {
+         printf "gnuplot is not available (which gnuplot) so cannot produce a graph\n";
+         exit(0);
+      }
+      $chart = "graph";
+   } else {
+      $chart = "table";
+      if ( $tableparam =~ "min" ) {
+         ( $chart_minutes ) = ($tableparam =~ /(\d+)min/);
+      }
+   }
+   $ndays = 365;
+   if ( $tableparam =~ "min" ) {
+      ( $chart_minutes ) = ($tableparam =~ /(\d+)min/);
+   } elsif ( $tableparam =~ "day" ) {
+      ( $ndays ) = ($tableparam =~ /(\d+)day/);
+   }
+   if ( $tableparam =~ "usage" ) {
+      $chart_data = "usage";
+   } elsif ( $tableparam =~ "memory" ) {
+      $chart_data = "memory";
+   } elsif ( $tableparam =~ "load" ) {
+      $chart_data = "load";
+   }
+   if ( $tableparam =~ "cpu" ) {
+      &get_job_metrics( $tablejid, $chart, $chart_data, $chart_minutes );
+   } elsif ($tableparam =~ "gpu" ) {
+      &get_gpu_job_metrics( $tablejid, $chart, $chart_data, $chart_minutes );
+   } elsif ($tableparam =~ "host|node"  ) {
+      &get_node_metrics( $tablenodename, $chart, $chart_data, $ndays );
+   } else {
+      printf "You must specify cpu, gpu, or host in |$tableparam|\n";
+      exit(0);
+   }
+}
+
+   # Parse the topology.conf file to get the nodes on each switch
+   # Create reverse lookup hash where node name gives switch name
+
+if( -e "$slurm_path/topology.conf" ) {
+   open( TOPOLOGY, "$slurm_path/topology.conf" )
+      or die "Could not open the $slurm_path/topology.conf file\n";
+
+   foreach $line ( <TOPOLOGY> ) {
+
+      chomp( $line );
+      next if( $line !~ "^SwitchName=" );
+      next if( $line !~ " Nodes=" );
+
+      ($switchname, $nodelist) = ($line =~ /^SwitchName=(\S+)\s+Nodes=(\S+)/);
+#printf "line = |$line|  switch = |$switchname|  nodelist = |$nodelist|\n";
+
+      ($linkspeed{ $switchname }) = ($line =~ /LinkSpeed=(\d+)/);
+#printf "line = |$line|  switch = |$switchname|  linkspeed = |$linkspeed{$switchname}|\n";
+
+      $basename = "";  @range1 = ();  @range2 = ();
+      $nodelist .= ",done";  # Mark the end
+
+      $nodelist =~ s/[,\[\]]/ /g;
+      foreach $word ( split( ' ', $nodelist ) ) {      # split on , and ] and [
+
+#printf "word = |$word|\n";
+         if( $word =~ "[a-zA-Z]" ) {   # Dump previous then start a new set of nodenames
+
+            if( $basename ) {          # Dump previous
+#printf "nrange1 = $#range1  nrange2 = $#range2\n";
+               if( $#range1 < 0 ) { push( @range1, -1); }   # Add dummy if empty
+               if( $#range2 < 0 ) { push( @range2, -1); }   # Add dummy if empty
+#printf "basename = |$basename|  range1 = |@range1|  range2 = |@range2|\n";
+               $digits = length($range1[0]);
+               foreach $r1 ( @range1 ) {
+                  foreach $r2 ( @range2 ) {
+#printf "r1 = $r1  r2 = $r2\n";
+                     $nodename = $basename;
+                     if( $r1 >= 0 ) { 
+                        for( $i=0; $i < $digits-length($r1); $i++) { $nodename .= '0'; }
+                        $nodename .= "$r1";
+                     }
+                     $nodename .= $midname;
+                     if( $r2 >= 0 ) { 
+                        for( $i=0; $i < $digits-length($r2); $i++) { $nodename .= '0'; }
+                        $nodename .= "$r2";
+                     }
+                     $switch{$nodename} = $switchname;
+                     #push @hostlist, $nodename;    # Grab from slurm.conf instead
+                     #$total_nodes++;
+#printf "switch = |$switchname|  nodename = |$nodename|\n";
+                  }
+               }
+            }
+
+            $basename = $word;         # Start a new nodename
+            @range1 = ();  @range2 = ();
+
+         } elsif( $word eq '-' ) {    # Catch the middle '-' on Comet
+
+            $midname  = $word;
+#printf "midname = |$midname|\n";
+
+         } else {                      # number or range
+
+            if( $word =~ '-' ) { ($lo, $hi) = split( '-', $word);
+            } else             { ($lo, $hi) = ($word, $word); }
+
+#printf "nlo = $lo  nhi = $hi\n";
+            for( $n = $lo; $n <= $hi; $n++ ) {
+               if( $midname ) { push( @range2, $n ); 
+               } else         { push( @range1, $n ); }
+            }
+         }
+      }
+   }
+   close( TOPOLOGY );
+}
+
+
+
+# Parse the slurm.conf file to get information about each host
+#NOTE- Would need to handle bracketted ranges in node names for Frontera
+
+open( SLURMCONF, "$slurm_path/slurm.conf" )
+   or die "Could not open the $slurm_path/slurm.conf file\n";
+
+foreach $line ( <SLURMCONF> ) {
+
+   chomp( $line );
+
+   if( $line =~ "^NodeName" ) {
+
+      ($hostgroup      ) = ($line =~ /NodeName=(\S+)/g);
+      foreach $host ( &get_hostnames( $hostgroup ) ) {
+         push @hostlist, $host;
+
+         #($ncores{$host} )  = ($line =~ /CPUs=(\S+)/);
+         ($sockets  )       = ($line =~ /Sockets[a-zA-Z]*=(\S+)/);
+         ($corespersocket ) = ($line =~ /CoresPerSocket=(\S+)/);
+         ($threads  )       = ($line =~ /ThreadsPerCore=(\S+)/);
+         #$ncores{$host} = $sockets * $corespersocket * $threads;
+
+         ($gb_total{$host}) = ($line =~ /RealMemory=(\S+)/);
+         $gb_total{$host} /= 1000;
+
+         ($tmpdisk{$host} ) = ($line =~ /TmpDisk=(\S+)/);
+
+         if( $tmpdisk{$host} ) { 
+            $tmpdisk{$host} = int( ($tmpdisk{$host} + 500) / 1000 );
+            $llist{$host} .= "$cyan$tmpdisk{$host} GB local disk$reset  ";
+         }
+
+         #( $gbps ) = ($line =~ /fabric:eth:[a-zA-Z_]+:([0-9]+)/);
+         #printf "|$gbps| eth\n";
+         #if( $gbps ) { $llist{$host} .= "$green$gbps Gbps Ethernet$reset  "; }
+         ( $gbps ) = ($line =~ /fabric:roce:[a-zA-Z_]+:([0-9]+)/);
+         if( $gbps ) { $llist{$host} .= "$green$gbps Gbps RoCE$reset  "; }
+         ( $gbps ) = ($line =~ /fabric:ib:[a-zA-Z_]+:([0-9]+)/);
+         if( $gbps ) { $llist{$host} .= "$green$gbps Gbps InfiniBand$reset  "; }
+         ( $gbps ) = ($line =~ /fabric:opa:[a-zA-Z_]+:([0-9]+)/);
+         if( $gbps ) { $llist{$host} .= "$green$gbps Gbps OmniPath$reset  "; }
+         ( $gbps ) = ($line =~ /fabric:iwarp:[a-zA-Z_]+:([0-9]+)/);
+         if( $gbps ) { $llist{$host} .= "$green$gbps Gbps iWarp$reset  "; }
+         #if( $line =~ /avx[^2]/ ) { $llist{$host} .= "${blue}AVX$reset  "; }
+         #if( $line =~ /avx2/ ) {    $llist{$host} .= "${blue}AVX2$reset  "; }
+         #if( $line =~ /knl/ ) {     $llist{$host} .= "${blue}KNL$reset  "; }
+
+         ($gpu_type{$host}, $ngpus{$host}) = ($line =~ /gpu:([^:]+):(\d)/);
+         if( $gpu_type{$host} ) { 
+            $llist{$host} .= "$dgreen$gpu_type{$host}$reset ";
+            #$llist{$host} .= "($red$gpu_total_mem{$host} GB$reset)  "; # in get_db()
+         }
+      }
+
+   #} elsif( $line =~ "^PartitionName" ) {    # Grab the owners for each node
+
+      #($part)  = ($line =~ /PartitionName=(\S+)/g);
+      #($nodes) = ($line =~ /Nodes=(\S+)/g);
+
+      #$name = &hostowner( $part );
+      #foreach $node ( split(',', $nodes) ) {
+         #$owner{$node} = $name;
+      #}
+   }
+}
+
+
+
+# Get hostnames from compressed list like Elf[12,13-15],Hero05 and return an array
+# Can expand multiple brackets like c###-#[0-9][1-4] for Stampede2.
+
+sub get_hostnames {
+   local( $list_in ) = @_;
+   @nlist = ();
+   @multi_nodes = ();
+
+   $list_in =~ s/,(\D)/ $1/g;   # Separate into nodes and node groups
+
+   foreach $nodegroup ( split( ' ', $list_in ) ) {
+
+      @xlist = ();
+      push @xlist, "";    # Initialize expansion list xlist
+
+
+         # Recursive loop to expand sets of square brackets in node lists
+EXPAND: 
+         if( $nodegroup !~ '\[' ) {
+
+            @new_xlist = ();
+            foreach $item ( @xlist ) {
+               push @new_xlist, $item . $nodegroup;
+            }
+            @xlist = @new_xlist;
+
+         } else {                    # Now handle the multi node groups
+
+            ($base, $mlist) = ($nodegroup =~ /([^\[]*)\[([0-9-,]+)\]/);
+            $mlist =~ s/,/ /g;
+
+            @new_xlist = ();
+            foreach $section ( split( ' ', $mlist) ) {
+               if( $section !~ '-' ) {
+                  foreach $item ( @xlist ) {
+                     push @new_xlist, $item . $base . $section;
+                  }
+               } else {
+                  ($nlo, $nhi) =  split( '-', $section );
+                  for( $n = $nlo; $n <= $nhi; $n++ ) {
+                     $base0 = $base;
+                     for( $i=0; $i < length($nlo)-length($n); $i++) { $base0 .= '0'; }
+                     foreach $item ( @xlist ) {
+                        push @new_xlist, $item . $base0 . $n;
+                     }
+                  }
+               }
+            }
+            @xlist = @new_xlist;
+            $nodegroup =~ s/[^]]+\]//;   # Delete what we just processed
+
+            if( $nodegroup ne "" ) { goto EXPAND; } # Recurse to expand the next brackets
+         }
+
+      foreach $item ( @xlist ) { push @nlist, $item; }
+   }
+
+   return @nlist;
+}
+
+# Print by switch name and number of nodes, then a node list
+#    sw1,sw2(5n),sw3(2n)  node[1-3],node4
+
+sub print_nodelist {
+   local( $list_in ) = @_;
+   $list_in =~ s/ //g;
+   @nlist = ();
+
+   #@nlist = ($list_in =~ /(\w+\d\d)/g);
+   @nlist = ($list_in =~ /([a-zA-Z]+\d+)/g);
+   @multi_nodes = ($list_in =~ /(\w+\[[^]]+\])/g);
+
+   foreach $node ( @multi_nodes ) {
+
+         # Sep switch and nodes
+
+      ($switch, $swnodes) = ($node =~ /([^[]+)\[([^\]]+)\]/);
+
+      foreach $nr ( split( ',', $swnodes ) ) {
+         if( $nr =~ '-' ) {
+            ($nlo, $nhi) = split( '-', $nr );
+         } else {
+            ($nlo, $nhi) = ($nr, $nr);
+         }
+         $digits = length( $nhi );
+         for( $n = $nlo; $n <= $nhi; $n++ ) {
+            $nodename = $switch;
+            for( $i=0; $i < $digits-length($n); $i++) { $nodename .= '0'; }
+            $nodename .= $n;
+            push( @nlist, $nodename );
+         }
+      }
+   }
+
+      # Count the nodes on each switch
+
+   %nodes = ();   
+   foreach $nodename ( @nlist ) {
+      $nodes{$switch{$nodename}}++;
+   }
+
+      # Yellow for minor alert for multi-switch MPI jobs
+
+   $nswitches = keys( %nodes );
+   if( $nswitches > 1        ) { printf $yellow; }
+   #} elsif( $nnodes{$jid} > 1 ) { printf $magenta; }
+
+      # Print the nodes on each switch
+
+   $count = 0;
+   if( $pr_longlist ) { printf "      "; }
+
+   foreach $sw ( keys %nodes ) {
+
+      $count++;
+      if   ( $count == 2 && ! $pr_longlist ) {printf ",\n   "; }
+      elsif( $count > 1  ) {printf ","; }
+
+      printf "$sw($nodes{$sw}n)";
+   }
+   printf "$reset";
+
+   if( $pr_longlist ) { printf " $green  $nodelist{$jid}$reset\n"; }
+}
+      
+
+# Configure colors for each type of host we have at Kansas State University
+
+sub hostcolor {
+   local( $host ) = @_;
+   $host = lc($host);
+   if( $host =~ "hero"    ) { return $brown; }
+   if( $host =~ "dwar"    ) { return $blue; } # Dwarf or Dwarves
+   if( $host =~ "mole"    ) { return $lgreen; } # Mole or Moles
+   if( $host =~ "gremlin" ) { return $pink; }
+   if( $host =~ "wizard"  ) { return $gold; } # Wizard or Wizards
+   if( $host =~ "warlock" ) { return $dred; }  # Warlocks
+   return $bold;
+}
+
+
+# Get db info for a host from the kstat_info DB
+#    Host metrics, job metrics, and job GPU metrics each minute
+
+sub get_db_info {
+
+   local( $host ) = @_;    # The host is passed in as the argument
+
+   ( $datestring ) = ( $line[$i] =~ /date-([0-9\-:T]+)/ );
+   $datetime{$i} = Time::Piece->strptime($datestring,'%Y-%m-%dT%T %z');
+
+      # Grab host metrics first for the latest 2 time stamps
+      #    CPU usage is accumulative, so must subtract from latest to get instant
+# DDT - host mem, cores alloc come from scontrol, only host CPU levels used now
+
+   $node_id = "";
+   $sth = $dbh->prepare("SELECT * FROM nodes WHERE node_name=\'$host\'");
+   $sth->execute() or die $DBI::errstr;
+   while( @row = $sth->fetchrow_array ) {   # Catch 1 row
+      $node_id = $row[0];
+      $ncores{$host} = $row[2];
+      $mem_total{$host} = $row[3]/1024.0;    # Total mem on node
+      $owner{$host} = $hostowner{$row[4]};  # Convert partitiion to owner
+      $ngpus{$host} = $row[5];
+      $tmpdisk{$host} = $row[6];
+   }
+   $sth->finish();
+   #printf "$host $node_id $mem_total{$host}\n";
+
+   if ( $node_id == "" ) {
+      return;
+   }
+
+   $sth = $dbh->prepare("SELECT * FROM node_metrics WHERE node_id=\'$node_id\' and time_stamp >= now() - INTERVAL '300 seconds' ORDER BY time_stamp DESC LIMIT 2");
+   $sth->execute() or die $DBI::errstr;
+
+   $#row = -1;
+   $#baserow = -1;
+   while( @frow = $sth->fetchrow_array ) {   # Catch 2 rows
+      if( scalar @row eq 0 ) {
+         @row = @frow;
+         $node_metrics_date{$host} = Time::Piece->strptime( $row[2], '%Y-%m-%d %H:%M:%S' );
+         $cores_used{$host} = $row[3];
+         $load{$host} = $row[4];    # comes from scontrol
+         $mem_used{$host}   = int(0.5+$row[9]);    # Slurm total - avail
+         $mem_alloc{$host} = int(0.5+$row[10]);    # Slurm allocated
+      } elsif( scalar @baserow eq 0 ) {
+         @baserow = @frow;
+      }
+   }
+   $sth->finish();
+
+   if ( scalar @row gt 0 and scalar @baserow gt 0 ) {
+      $row[5] -= $baserow[5];
+      $row[6] -= $baserow[6];
+      $row[7] -= $baserow[7];
+      $row[8] -= $baserow[8];
+      $cpu_total = $row[5] + $row[6] + $row[7] + $row[8];
+      if ( $cpu_total gt 0.0 ) {
+         $cpu_user = 100.0*$row[5]/$cpu_total;
+         $cpu_sys  = 100.0*$row[6]/$cpu_total;
+         $cpu_idle = 100.0*$row[7]/$cpu_total;
+         $cpu_wait = 100.0*$row[8]/$cpu_total;
+      }
+   } else {
+      $cpu_user = 0.0;
+      $cpu_sys  = 0.0;
+      $cpu_idle = 0.0;
+      $cpu_wait = 0.0;
+   }
+
+      # Grab latest job metrics for this host
+
+   $sth = $dbh->prepare("SELECT DISTINCT job_id FROM job_metrics WHERE node_id=\'$node_id\' and time_stamp >= now() - INTERVAL '120 seconds'");
+   $sth->execute() or die $DBI::errstr;
+
+   $jidlist = "";
+   while( @frow = $sth->fetchrow_array ) {   # Get all job IDs on the host
+      $jidlist .= "$frow[0] ";
+      #printf "jid = $jid\n";
+   }
+   $sth->finish();
+
+   foreach $jid ( split( ' ', $jidlist ) ) {
+      $sth = $dbh->prepare("SELECT * FROM job_metrics WHERE node_id=\'$node_id\' and job_id=\'$jid\' ORDER BY time_stamp DESC LIMIT 2");
+      $sth->execute() or die $DBI::errstr;
+
+      $#row = -1;
+      $#baserow = -1;
+      while( @frow = $sth->fetchrow_array ) {   # Save last 2 rows for each jid
+         if( scalar @row eq 0 ) {
+            @row = @frow;
+         } elsif( scalar @baserow eq 0 ) {
+            @baserow = @frow;
+         }
+      }
+      $sth->finish();
+
+      $job_metrics_date = $row[3];
+      $ncores_on_host{$host.$jid} = $row[4];  # ncores for jid on this host from cpuset
+
+      $row[5] -= $baserow[5];
+      $row[6] -= $baserow[6];
+      $row[7] -= $baserow[7];
+      $row[8] -= $baserow[8];
+      $job_cpu_total = $row[5] + $row[6] + $row[7] + $row[8];
+      if ( $job_cpu_total gt 0.0 ) {
+         $jobcpu_user{$jid} = 100.0*$row[5]/$job_cpu_total;
+         $jobcpu_sys{$jid}  = 100.0*$row[6]/$job_cpu_total;
+         $jobcpu_idle{$jid} = 100.0*$row[7]/$job_cpu_total;
+         $jobcpu_wait{$jid} = 100.0*$row[8]/$job_cpu_total;
+      }
+
+      $jobmem{$host.$jid} = $row[9];
+      $jobmaxmem{$host.$jid} = $row[10];
+      $jobswapmem{$host.$jid} = $row[11];
+# DDT - max swap is not reliable
+      $jobswapmax{$host.$jid} = $row[12];
+
+      #printf "$host job metrics $jid $job_metrics_date $jobmem{$host.$jid} $jobmaxmem{$host.$jid} $jobswapmem{$host.$jid} $jobswapmax{$host.$jid} $jobcpu_user{$jid} $jobcpu_sys{$jid} $jobcpu_idle{$jid} $jobcpu_wait{$jid}\n";
+   }
+
+      # Grab latest job GPU metrics for this host
+      #   Start by getting the node_gpu_id to see if there are GPUs on this host
+
+   $sth = $dbh->prepare("SELECT * FROM node_gpus WHERE node_id=\'$node_id\' and gpu_num != \'-1\'");
+   $sth->execute() or die $DBI::errstr;
+   $gpu_id_list = "";
+   while( @row = $sth->fetchrow_array ) {   # Catch each row and process
+      $gpu_id = $row[0];
+      $gpu_id_list .= "$gpu_id ";
+      $gputype{$gpu_id} = $row[2];
+      #$gpu_type{$host} = $row[2];  # Set from slurm.conf to match --gres= request type
+      $gpunum{$gpu_id} = $row[3];
+      $gpumemtot{$gpu_id} = $row[5];
+      $gpu_total_mem{$host} = $row[5];   # Used in print host info llist below
+   }
+   $sth->finish();
+
+   if( $gpu_total_mem{$host} ) {
+      $gpu_gb = $gpu_total_mem{$host} / 1000.0;
+      $llist{$host} .= "($dgreen$gpu_gb GB$reset)";
+   }
+   if ( $gpu_id_list eq "" ) {
+      #printf "No GPUs on $host\n";
+   } else {  # Grab the latest job_gpu_metrics data
+      foreach $gid  ( split( ' ', $gpu_id_list ) ) {
+         #printf "Job GPU metrics for $host $gid\n";
+
+         $gnum = $gpunum{$gid};
+         $ngpus{$jid} = 0;
+         $sth = $dbh->prepare("SELECT * FROM job_gpu_metrics WHERE node_id=\'$node_id\' and node_gpu_id=\'$gid\' and time_stamp >= now() - INTERVAL '120 seconds'");
+         $sth->execute() or die $DBI::errstr;
+         while( @row = $sth->fetchrow_array ) {   # Catch each row and process
+            $jid = $row[3];
+            if( not $ngpus{$jid} ) { $ngpus{$jid} = 0; }
+            $ngpus{$jid} += 1;
+            $gpu_util{$jid.$gnum} = $row[5];
+            $gpu_mem_used{$jid.$gnum} = $row[6];
+            if ( $gpu_nums{$jid} !~ $gpunum{$gid} ) {
+               $gpu_nums{$jid} .= "$gpunum{$gid} ";
+            }
+            $gpu_type{$jid.$gnum} = $gputype{$gid};
+            $gpu_mem_total{$jid.$gnum} = $gpumemtot{$gid};
+            #printf "Job GPU metrics $jid $gnum $gpu_type{$jid.$gnum} $gpu_util{$jid.$gnum} $gpu_mem_used{$jid.$gnum}\n";
+         }
+         $sth->finish();
+      }
+   }
+}
+
+   # Grab the CPU_user and mem_used for a given job ID number
+
+sub get_job_metrics {
+
+   $jid  = @_[0];
+   $chart = @_[1];
+   $chart_data = @_[2];
+   $chart_minutes = @_[3];
+
+   $graph_file = $ENV{"HOME"} . "/.kstat.gnuplot.png",
+
+   $sth = $dbh->prepare("SELECT * FROM job_metrics WHERE job_id=\'$jid\' ORDER BY time_stamp ASC");
+   $sth->execute() or die $DBI::errstr;
+   $i = 0;
+   $count = 0;
+   @lastrow = ( 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 );
+   while( @row = $sth->fetchrow_array ) {   # Catch each row and process
+      #printf "@row\n";
+      if ( $count % $chart_minutes == 0 ) {
+         $job_date[$i] = $row[3];
+         $ncores[$i] = $row[4];
+      }
+      $total_usage  = $row[5]-$lastrow[5];
+      $total_usage += $row[6]-$lastrow[6];
+      $total_usage += $row[7]-$lastrow[7];
+      $total_usage += $row[8]-$lastrow[8];
+      if ( $total_usage == 0 ) {
+         printf "WARNING - CPU usage for job $jid is zero for row $count\n";
+      } else {
+         $cpu_user[$i]   += 100.0*($row[5] - $lastrow[5])/$total_usage;
+         $cpu_system[$i] += 100.0*($row[6] - $lastrow[6])/$total_usage;
+         $cpu_idle[$i]   += 100.0*($row[7] - $lastrow[7])/$total_usage;
+         $cpu_iowait[$i] += 100.0*($row[8] - $lastrow[8])/$total_usage;
+      }
+      $mem_used[$i] += $row[9];
+      $mem_max[$i]  += $row[10];
+      $swap[$i] += int($row[11]+0.5);
+      $swap_max[$i] += int($row[12]+0.5);
+      $count ++;
+      if ( $count % $chart_minutes == 0 ) {
+         $i ++;
+      }
+      @lastrow = @row;
+   }
+   $sth->finish();
+
+   if ( $count == 0 ) {
+      printf "No data present for job $jid in the database\n";
+      exit(0);
+   }
+
+   for ( $i = 0; $i < scalar @cpu_user; $i ++ ) {
+      $den = $chart_minutes;
+      if ( $i == $#cpu_user ) {   # Last index may be partial sum
+         $den = (($count-1) % $chart_minutes ) + 1;
+      }
+      #printf "$i $#cpu_user $count $den\n";
+      $cpu_user[$i]   /= $den;
+      $cpu_system[$i] /= $den;
+      $cpu_idle[$i]   /= $den;
+      $cpu_iowait[$i] /= $den;
+      $mem_used[$i]   /= $den;
+      $mem_max[$i]    /= $den;
+      $swap[$i]       /= $den;
+      $swap_max[$i]   /= $den;
+   }
+
+   if ( $chart eq "graph" ) {     # Print gnuplot commands to ~/.kstat.gnuplot
+
+      $ks_gp      = $ENV{"HOME"} . "/.kstat.gnuplot";
+      $ks_gp_data = $ENV{"HOME"} . "/.kstat.gnuplot.data";
+      $ks_gp_png  = $ENV{"HOME"} . "/.kstat.gnuplot.png";
+
+      open $gp_out, '>', $ks_gp
+         or die "Could not open the $ks_gp\n";
+      open $gp_data, '>', $ks_gp_data
+         or die "Could not open the $ks_gp_data\n";
+
+      print $gp_out "set title \"Job $jid CPU usage\" font \"arial,20,bold\"\n";
+      print $gp_out "set key fixed center right nobox font \"arial,16,bold\"\n";
+      print $gp_out "set key autotitle columnhead\n";
+
+      print $gp_out "set xlabel \"Time in Minutes\" font \"arial,20,bold\"\n";
+      print $gp_out "set xtics font \"arial,16,bold\"\n";
+      print $gp_out "set yrange [0.0:100.0]\n";
+      print $gp_out "set ytics font \"arial,16,bold\"\n";
+
+      print $gp_out "set style data lines\n";
+
+      if( $chart_data eq "usage" ) {
+         print $gp_out "set ylabel \"Usage Type in Percent\" font \"arial,20,bold\"\n";
+         print $gp_out "set style line 1 lw 3 lt 1 lc rgb \"green\"\n";
+         print $gp_out "set style line 2 lw 3 lt 1 lc rgb \"orange\"\n";
+         print $gp_out "set style line 3 lw 3 lt 1 lc rgb \"red\"\n";
+         print $gp_out "set style line 4 lw 3 lt 1 lc rgb \"cyan\"\n";
+
+         print $gp_data " Minutes  User  System  Idle  \"IO Wait\"\n";
+         for( $i = 0; $i < scalar @cpu_user; $i ++ ) {
+            $minutes = ($i+1) * $chart_minutes;
+            print $gp_data "$minutes $cpu_user[$i] $cpu_system[$i] $cpu_idle[$i] $cpu_iowait[$i]\n";
+         }
+
+         print $gp_out "plot \"$ks_gp_data\" using 1:2 ls 1, '' using 1:3 ls 2, '' using 1:4 ls 3, '' using 1:5 ls 4\n";
+
+      } elsif ( $chart_data eq "memory" ) {
+
+         print $gp_out "set ylabel \"Memory Usage in GigaBytes\" font \"arial,20,bold\"\n";
+         print $gp_out "set style line 1 lw 3 lt 1 lc rgb \"orange\"\n";
+         print $gp_out "set style line 1 lw 3 lt 1 lc rgb \"black\"\n";
+
+         print $gp_data " Minutes  \"Memory GB\"\n";
+         for( $i = 0; $i < scalar @cpu_user; $i ++ ) {
+            $minutes = ($i+1) * $chart_minutes;
+            print $gp_data "$minutes $mem_used[$i] $mem_max[$i]\n";
+         }
+
+         print $gp_out "plot \"$ks_gp_data\" using 1:2 ls 1, '' using 1:3 ls 2\n";
+
+      }
+
+      close($gp_data);
+      close($gp_out);
+
+      printf "Plotting file $ks_gp with data $ks_gp_data to png image file $ks_gp_png\n";
+      `gnuplot -p -e "set terminal png" $ks_gp`;
+
+      printf "Plotting file $ks_gp with data $ks_gp_data to the screen using gnuplot\n";
+      `gnuplot -p -e "set terminal x11 size 1200,800" $ks_gp`;
+
+   } elsif ( $chart eq "table" ) {   # One table for everything
+
+      printf "\n    CPU and Memory Usage for job $blue$jid$reset every $chart_minutes minutes\n";
+      printf "   Minutes  ${green}User  ${yellow}System    ${red}Idle   ${cyan}IO Wait   ${orange}Memory     ${red}Disk Swap\n";
+      for( $i = 0; $i < scalar @cpu_user; $i ++ ) {
+         printf( " $reset%7d", $i*$chart_minutes );
+         printf( "  $green%5.1f%%", $cpu_user[$i]);
+         printf( "  $yellow%5.1f%%", $cpu_system[$i]);
+         printf( "  $red%5.1f%%", $cpu_idle[$i]);
+         printf( "  $cyan%5.1f%%", $cpu_iowait[$i]);
+         printf( "  $orange%8.3f gb", $mem_used[$i]);
+         printf( "  $red%8.3f gb\n", $swap[$i]);
+      }
+      printf "$reset";
+   }
+   exit();
+}
+
+   # Grab the cores, load, usage, and memory for a given host or for all hosts
+
+sub get_node_metrics {
+
+   $host  = @_[0];
+   $chart = @_[1];
+   $chart_data = @_[2];
+   $ndays = @_[3];
+
+   if ( $chart eq "graph" and $chart_data eq "usage" and $host eq "all" ) {
+      printf( "Usage not implemented for multiple nodes\n");
+      exit(0);
+   }
+
+   $graph_file = $ENV{"HOME"} . "/.kstat.gnuplot.png";
+
+      # Get the node_id using the host name
+
+   if ( $host eq "all" ) {
+      $sth = $dbh->prepare("SELECT * FROM nodes");
+   } else {
+      $sth = $dbh->prepare("SELECT * FROM nodes WHERE node_name=\'$host\'");
+   }
+   $sth->execute() or die $DBI::errstr;
+   $nnodes = 0;
+   while( @row = $sth->fetchrow_array ) {   # Catch 2 rows
+      $nnodes ++;
+      $node_id{$host} = $row[0];
+      $ncores{$host} += $row[2];
+      $mem_total{$host} += $row[3]/1024.0;    # Total mem on node
+      $owner{$host} = $hostowner{ $row[4]};  # Convert partitiion to owner
+      $ngpus{$host} += $row[5];
+      $tmpdisk{$host} += $row[6];
+   }
+   $sth->finish();
+
+   if ( $host eq "all" ) {
+      printf " This cluster has $nnodes nodes $ncores{$host} cores $ngpus{$host} GPUs and";
+      printf(" %9.3f TB memory\n", $mem_total{$host}/1024.0);
+   }
+   #printf "$host $node_id{$host} $mem_total{$host}\n";
+
+      # Get all node metrics for that host for the past $ndays days
+      #    Calculate them as daily averages
+
+   if ( $host eq "all" ) {
+      $sth = $dbh->prepare("SELECT * FROM node_metrics WHERE time_stamp >= now() - INTERVAL '$ndays DAY' ORDER BY time_stamp ASC");
+   } else {
+      $sth = $dbh->prepare("SELECT * FROM node_metrics WHERE node_id=\'$node_id{$host}\' and time_stamp >= now() - INTERVAL '$ndays DAY' ORDER BY time_stamp ASC");
+   }
+   $sth->execute() or die $DBI::errstr;
+
+   $i = -1;
+   $thisdate = 0;
+   @lastrow = ( 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 );
+   while( @row = $sth->fetchrow_array ) {   # Catch each row and process
+      $datetime = Time::Piece->strptime( $row[2], '%Y-%m-%d %H:%M:%S' );
+      if ( $datetime->date ne $thisdate ) {    # New day, start sums over;
+         $i ++;
+         $count[$i] = 0;
+         $nnodes[$i] = 0;
+         %node_id_list = ();
+         $thisdate = $datetime->date;
+         @lastrow = ( 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 );
+      }
+      if ( not exists($node_id_list{ $row[1] }) ) {
+         $node_id_list{ $row[1] } = 1;
+         $nnodes[$i] ++;
+      }
+      $count[$i] ++;
+      #printf "$i  @row\n";
+      #$dt = $datetime->date;
+      #printf "$i  $count[$i]   $dt   $date[$i]\n";
+      $ncores[$i] += $row[3];
+      $load[$i] += $row[4];
+      $total_usage  = $row[5]-$lastrow[5];
+      $total_usage += $row[6]-$lastrow[6];
+      $total_usage += $row[7]-$lastrow[7];
+      $total_usage += $row[8]-$lastrow[8];
+      if ( $total_usage > 0.0 ) {
+         $cpu_user[$i]   += 100.0*($row[5] - $lastrow[5])/$total_usage;
+         $cpu_system[$i] += 100.0*($row[6] - $lastrow[6])/$total_usage;
+         $cpu_idle[$i]   += 100.0*($row[7] - $lastrow[7])/$total_usage;
+         $cpu_iowait[$i] += 100.0*($row[8] - $lastrow[8])/$total_usage;
+      }
+      $mem_used[$i] += $row[9];
+      $mem_alloc[$i]  += $row[10];
+      #printf "job_metrics for $jid  $cpu_user[$i]%%  $mem_used[$i]gb $job_date[$i]\n";
+      @lastrow = @row;
+   }
+   $sth->finish();
+
+      # Calculate daily averages from by-minute summaries
+
+   #printf "i = $i    $count[0]   $#cpu_user\n";
+      #exit(0);
+   for $j ( 0 .. $i ) {
+      $ncores[$j]     *= $nnodes[$j]/$count[$j];
+      $load[$j]       *= $nnodes[$j]/$count[$j];
+      $cpu_user[$j]   /= $count[$j];
+      $cpu_system[$j] /= $count[$j];
+      $cpu_idle[$j]   /= $count[$j];
+      $cpu_iowait[$j] /= $count[$j];
+      $mem_used[$j]   *= $nnodes[$j]/$count[$j];
+      $mem_alloc[$j]  *= $nnodes[$j]/$count[$j];
+      $mem_total_array[$j] = $mem_total{$host};
+   }
+
+      # Graph the daily averages
+
+   if ( $chart eq "graph" ) {
+
+      $ks_gp      = $ENV{"HOME"} . "/.kstat.gnuplot";
+      $ks_gp_data = $ENV{"HOME"} . "/.kstat.gnuplot.data";
+      $ks_gp_png  = $ENV{"HOME"} . "/.kstat.gnuplot.png";
+
+      open $gp_out, '>', $ks_gp
+         or die "Could not open the $ks_gp\n";
+      open $gp_data, '>', $ks_gp_data
+         or die "Could not open the $ks_gp_data\n";
+
+      print $gp_out "set title \"Node $host CPU Usage\" font \"arial,20,bold\"\n";
+      print $gp_out "set key fixed center right nobox font \"arial,16,bold\"\n";
+      print $gp_out "set key autotitle columnhead\n";
+
+      print $gp_out "set xlabel \"Time in Minutes\" font \"arial,20,bold\"\n";
+      print $gp_out "set xtics font \"arial,16,bold\"\n";
+      print $gp_out "set ytics font \"arial,16,bold\"\n";
+
+      print $gp_out "set style data lines\n";
+
+      if ( $chart_data eq "load" ) {
+
+         print $gp_out "set ylabel \"Node CPU Load\" font \"arial,20,bold\"\n";
+         print $gp_out "set style line 1 lw 3 lt 1 lc rgb \"blue\"\n";
+         print $gp_out "set style line 2 lw 3 lt 1 lc rgb \"black\"\n";
+
+         print $gp_data " Minutes  Load  Cores\n";
+         for( $i = 0; $i < scalar @cpu_user; $i ++ ) {
+            $minutes = ($i+1) * $chart_minutes;
+            print $gp_data "$minutes $load[$i] $ncores[$i]\n";
+         }
+
+         print $gp_out "plot \"$ks_gp_data\" using 1:2 ls 1, '' using 1:3 ls 2\n";
+
+      } elsif ( $chart_data eq "usage" ) {
+
+         print $gp_out "set ylabel \"Node CPU Usage\" font \"arial,20,bold\"\n";
+         print $gp_out "set yrange [0.0:100.0]\n";
+         print $gp_out "set style line 1 lw 3 lt 1 lc rgb \"green\"\n";
+         print $gp_out "set style line 2 lw 3 lt 1 lc rgb \"yellow\"\n";
+         print $gp_out "set style line 3 lw 3 lt 1 lc rgb \"red\"\n";
+         print $gp_out "set style line 4 lw 3 lt 1 lc rgb \"cyan\"\n";
+
+         print $gp_data " Minutes  User  System  Idle  \"IO Wait\"\n";
+         for( $i = 0; $i < scalar @cpu_user; $i ++ ) {
+            $minutes = ($i+1) * $chart_minutes;
+            print $gp_data "$minutes $cpu_user[$i] $cpu_system[$i] $cpu_idle[$i] $cpu_iowait[$i]\n";
+         }
+
+         print $gp_out "plot \"$ks_gp_data\" using 1:2 ls 1, '' using 1:3 ls 2, '' using 1:4 ls 3, '' using 1:5 ls 4\n";
+
+      } elsif ( $chart_data eq "memory" ) {
+
+         print $gp_out "set ylabel \"Host $host CPU Memory\" font \"arial,20,bold\"\n";
+         $mem_max_range = 100.0 * int( (99 + $mem_total[$host]) );
+         print $gp_out "set yrange [0.0:$mem_max_range]\n";
+         print $gp_out "set style line 1 lw 3 lt 1 lc rgb \"orange\"\n";
+         print $gp_out "set style line 1 lw 3 lt 1 lc rgb \"yellow\"\n";
+         print $gp_out "set style line 1 lw 5 lt 1 lc rgb \"black\"\n";
+
+         print $gp_data " Minutes \"Memory Used\" \"Memory Allocated \" \"Memory Total\"\n";
+         for( $i = 0; $i < scalar @cpu_user; $i ++ ) {
+            $minutes = ($i+1) * $chart_minutes;
+            print $gp_data "$minutes $mem_used[$i] $mem_alloc[$i] $mem_total[$host]\n";
+         }
+         close($gp_data);
+
+         print $gp_out "plot \"$ks_gp_data\" using 1:2 ls 1, '' using 1:3 ls 2, '' using 1:4 ls 3, '' using 1:5 ls 4\n";
+         close($gp_out);
+
+      }
+
+      close($gp_data);
+      close($gp_out);
+
+      printf "Plotting file $ks_gp with data $ks_gp_data to png image file $ks_gp_png\n";
+      `gnuplot -p -e "set terminal png" $ks_gp`;
+
+      printf "Plotting file $ks_gp with data $ks_gp_data to the screen using gnuplot\n";
+      `gnuplot -p -e "set terminal x11 size 1200,800" $ks_gp`;
+
+   } elsif ( $chart eq "table" ) {   # One table for everything
+
+      if ( $host eq "all" ) {
+
+         printf "\n    Usage and Memory for ${blue}all nodes$reset for $blue$ndays days$reset\n";
+         printf " Day Cores  Load    ${orange}Used    Alloc   Total Memory$reset\n";
+      } else {
+         printf "\n    Usage and Memory for host $blue$host$reset for $blue$ndays days$reset\n";
+         printf " Day Cores  Load    ${green}User  ${yellow}System    ${red}Idle   ${cyan}IO Wait   ${orange}Used    Alloc   Total Memory$reset\n";
+
+      }
+
+      for( $i = 0; $i <= $#cpu_user; $i += 1 ) {
+         printf( "$reset%4d", $i );
+         printf( "  $reset%3d", $ncores[$i] );
+         printf( "  $reset%5.1f", $load[$i] );
+         if ( $host ne "all" ) {
+            printf( "  $green%5.1f%%", $cpu_user[$i] );
+            printf( "  $yellow%5.1f%%", $cpu_system[$i] );
+            printf( "  $red%5.1f%%", $cpu_idle[$i] );
+            printf( "  $cyan%5.1f%%", $cpu_iowait[$i] );
+         }
+         printf( "   $orange%6.0f   %6.0f   %6.0f GB$reset\n", 
+                  $mem_used[$i], $mem_alloc[$i], $mem_total{$host} );
+      }
+      printf "$reset";
+   }
+   exit();
+}
+
+   # Grab the GPU usage and GPU mem usage for a given job on a given host
+
+sub get_gpu_job_metrics {
+
+   $jid  = @_[0];
+   $chart = @_[1];
+   $chart_data = @_[2];
+   $chart_minutes = @_[3];
+
+   $graph_file = $ENV{"HOME"} . "/.kstat.gnuplot.png",
+
+   $sth = $dbh->prepare("SELECT * FROM job_gpu_metrics WHERE job_id=\'$jid\' ORDER BY time_stamp ASC");
+   $sth->execute() or die $DBI::errstr;
+   $gpu_id_list = "";
+   $n_gpus = 0;
+   $count = 0;
+   while( @row = $sth->fetchrow_array ) {   # Catch each row and process
+      $node_id = $row[1];
+      $gpu_id = $row[2];
+      $new_gpu = "";
+      if( $gpu_id_list !~ $gpu_id ) {
+         $gpu_id_list .= " $gpu_id";
+         $n_gpus ++;
+         $new_gpu = "True";
+      }
+      $i = int($count / ($n_gpus * $chart_minutes));
+      $job_date[$i] = $row[4];  # May be over written several times
+      $gpu_user[$i] += $row[5];
+      $gpu_mem_used[$i] += $row[6];
+      $count ++;
+   }
+   $sth->finish();
+
+   if ( $count == 0 ) {
+      printf "No data present for GPU job $jid in the database\n";
+      exit(0);
+   }
+
+   for ( $i = 0; $i < scalar @gpu_user; $i ++ ) {
+      $den = $n_gpus * $chart_minutes;
+      if ( $i == $#gpu_user ) {  # Last range may contain partial sum
+         $den = (($count-1) % $den ) + 1;
+      }
+      $gpu_user[$i]   /= $den;
+      $gpu_mem_used[$i]   /= $den;
+   }
+
+   if ( $chart eq "graph" ) {
+
+      $ks_gp      = $ENV{"HOME"} . "/.kstat.gnuplot";
+      $ks_gp_data = $ENV{"HOME"} . "/.kstat.gnuplot.data";
+      $ks_gp_png  = $ENV{"HOME"} . "/.kstat.gnuplot.png";
+
+      open $gp_out, '>', $ks_gp
+         or die "Could not open the $ks_gp\n";
+      open $gp_data, '>', $ks_gp_data
+         or die "Could not open the $ks_gp_data\n";
+
+      print $gp_out "set title \"GPU Usage for Job $jid\" font \"arial,20,bold\"\n";
+      print $gp_out "set key fixed center right nobox font \"arial,16,bold\"\n";
+      print $gp_out "set key autotitle columnhead\n";
+
+      print $gp_out "set xlabel \"Time in Minutes\" font \"arial,20,bold\"\n";
+      print $gp_out "set xtics font \"arial,16,bold\"\n";
+      print $gp_out "set ytics font \"arial,16,bold\"\n";
+
+      print $gp_out "set style data lines\n";
+
+      if ( $chart_data eq "usage" ) {
+
+         print $gp_out "set ylabel \"GPU Usagein Percent\" font \"arial,20,bold\"\n";
+         print $gp_out "set yrange [0.0:100.0]\n";
+         print $gp_out "set style line 1 lw 3 lt 1 lc rgb \"green\"\n";
+
+         print $gp_data " Minutes  \"GPU Usage\"\n";
+         for( $i = 0; $i < scalar @gpu_user; $i ++ ) {
+            $minutes = ($i+1) * $chart_minutes;
+            print $gp_data "$minutes $gpu_user[$i]\n";
+         }
+
+         print $gp_out "plot \"$ks_gp_data\" using 1:2 ls 1\n";
+
+      } elsif ( $chart_data eq "memory" ) {
+
+            # Get max memory for GPU
+
+         $sth = $dbh->prepare("SELECT * FROM node_gpus WHERE node_id=\'$node_id\' and node_gpu_id=\'$gpu_id\'");
+         $sth->execute() or die $DBI::errstr;
+         while( @row = $sth->fetchrow_array ) {   # Catch each row and process
+            $gpu_total_mem = $row[5];
+         }
+         $sth->finish();
+
+         print $gp_out "set ylabel \"GPU Memoryin GigaBytes\" font \"arial,20,bold\"\n";
+         #print $gp_out "set yrange [0.0:100.0]\n";
+         print $gp_out "set style line 1 lw 3 lt 1 lc rgb \"purple\"\n";
+         print $gp_out "set style line 1 lw 5 lt 1 lc rgb \"black\"\n";
+
+         print $gp_data " Minutes  \"GPU Memory\"  \"Total GPU Memory\"\n";
+         for( $i = 0; $i < scalar @gpu_user; $i ++ ) {
+            $minutes = ($i+1) * $chart_minutes;
+            print $gp_data "$minutes $gpu_mem_used[$i] $gpu_total_mem\n";
+         }
+
+         print $gp_out "plot \"$ks_gp_data\" using 1:2 ls 1, '' using 1:3 ls 2\n";
+
+      }
+
+      close($gp_data);
+      close($gp_out);
+
+      printf "Plotting file $ks_gp with data $ks_gp_data to png image file $ks_gp_png\n";
+      `gnuplot -p -e "set terminal png" $ks_gp`;
+
+      printf "Plotting file $ks_gp with data $ks_gp_data to the screen using gnuplot\n";
+      `gnuplot -p -e "set terminal x11 size 1200,800" $ks_gp`;
+
+   } elsif ( $chart eq "table" ) {
+
+      printf "\n    Average GPU usage and memory for job $blue$jid$reset every $chart_minutes minutes\n";
+      printf "  Minutes  ${green}Usage    ${orange}Memory\n";
+      for( $i = 0; $i < scalar @gpu_user; $i ++ ) {
+         printf( " $reset%7d", $i*$chart_minutes );
+         printf( "  $green%5.1f%%  $orange%8.3f mb\n", $gpu_user[$i], $gpu_mem_used[$i] );
+      }
+      printf "$reset";
+   }
+
+   exit();
+}
+
+
+if( $days_ago ) {     # Only do sacct -d $days_ago for $susers
+   &sacct();
+   exit;
+}
+
+
+# Parse all information we can get from the squeue command
+#    Using fixed widths since some elements are left blank if not specified
+#       (dependency, nodelist, minmemory, reason, and gres when killable:1 used)
+#    NOTE - requesting groups on Beocat adds significant time
+#    NOTE - Using fixed widths sucks but Slurm does not provide a delimiter
+
+$squeue_command = "squeue -a --noheader --Format=jobid:200,arraytaskid:200,username:200,name:200,numnodes:200,numcpus:200,tres:200,mintmpdisk:200,partition:200,account:200,gres:200,feature:200,contiguous:200,reqswitch:200,timelimit:200,submittime:200,starttime:200,timeused:200,timeleft:200,statecompact:200,priority:200,network:200,reason:200,dependency:200,reqnodes:200,nodelist:4000";
+foreach $line (`$squeue_command`) {
+
+   chomp( $line );
+   @section = unpack( "(A200)25A4000", $line );
+
+   $j = shift @section;  # JobID and possible array task ID 1234_56 or 1234_[5-10%300]
+   ($jid) = ( $j =~ /(\d+)/ );  # Just the job ID, not the task ID
+   $jid_a{$jid} = $j;           # Store JobID plus Array task for printing
+   $tid = shift @section;  # Just the array task ID
+   $tid =~ s/%\d+//g;      # get rid of the %300 (launch max of 300 at once)
+   if( $tid !~ "N/A" ) { $jid_a{$jid} .= "_$tid"; }
+
+   $user{$jid} = shift @section;
+   if( $pr_names and ! $uname{$user{$jid}} ) {    # Get the full name if requested
+
+      if( $pr_names eq "full names" ) {
+         $line = `getent passwd $user{$jid}`;
+         $name=(split( ':', $line ) )[4];
+
+         if( $name =~ ',' ) {
+            $uname{$user{$jid}} = (split(',', $name))[1] . (split(',',$name))[0];
+         } else {
+            $uname{$user{$jid}} = $name;
+         }
+      } else {    # No names
+         $count = scalar %uname;
+         $uname{$user{$jid}} = "User$count";
+      }
+
+   }
+
+   $prog{$jid} = shift @section;
+   if( $prog{$jid} =~ "sys.dash" ) {
+      #$prog{$jid} = $brown . "OnDemand" . $reset;
+      $prog{$jid} = "OnDemand";
+   }
+   $nnodes{$jid} = shift @section;
+   #printf "$jid  $nnodes{$jid}\n";
+   if( $nnodes{$jid} == 0 ) { $nnodes{$jid} = 1; }
+   #printf "$jid  $nnodes{$jid}\n";
+   $ncores{$jid} = shift @section;
+if( $ncores{$jid} == 0 ) { printf "1 ncores($jid) $ncores{$jid}\n"; $ncores{$jid} = -1; }
+
+   $ncores_per_node{$jid} = $ncores{$jid} / $nnodes{$jid};
+
+   $tres = shift @section;  # tres  cpu=#,mem=#G,node=#
+   ($nnodes_tres{$jid}) = ($tres =~ /node=(\d+)/);
+   ($mem, $unit) = ($tres =~ /mem=([.0-9]+)(.)/);
+   if( $mem and $unit eq 'M' or $unit !~ "K|M|G|T" ) { 
+      $mem /= 1000;   # MB to GB
+   } elsif( $mem and $unit eq 'T' ) {
+      $mem *= 1000;   # TB to GB
+   }
+   if( $mem ) { $reqmem{$jid} = int($mem + 0.5) . "gb" }; # Blank when mem req not allowed
+
+   $next = shift @section;
+   if( $next > 0 ) { $reqtmp{$jid} = lc($next) . "b tmp"; }
+
+      # Shorten all partition names for display purposes
+
+   $part = shift @section;
+   if( $part =~ "killable" ) { $killable{$jid} = "killable"; }
+   $part =~ s/batch.q//g;
+   $part =~ s/killable.q//g;
+   @words = split( ",+", $part );
+   foreach $word ( @words ) {
+      if( $word ne "" and $word ne " " ) {
+         $partition{$jid} .= $hostowner{$word} . ' ';
+      }
+   }
+
+   $account{$jid} = shift @section;
+   $next = shift @section;
+   if( $next =~ "gres.gpu" ) {
+      ($gpu_type{$jid}, $gpus{$jid}) = ($next =~ /gres.gpu:([^:]+):([0-9])/);
+      if( $gpu_type{$jid} eq "" ) {    # No GPU type specified
+         ($gpus{$jid}) = ($next =~ /gres.gpu:([0-9])/);
+         $gpu_type{$jid} = "";
+      }
+   }
+#printf( "jid=%d next=|%s| gpus=%d gpu_type=|%s|\n", $jid, $next, $gpus{$jid}, $gpu_type{$jid} );
+   if( $next =~ "fabric" ) {$fabric{$jid} = $next }
+   $next = shift @section;
+   if( $next !~ "null" and $next !~ "os_el" ) { $features{$jid} = $next; }
+
+   $contiguous{$jid} = shift @section;
+   $reqswitch{$jid} = shift @section;
+
+      # Store the time info available
+
+   $reqtime{$jid} = shift @section;
+   $submittime{$jid} = shift @section;
+   $starttime{$jid} = shift @section;    # Not currently used
+   $runtime{$jid} = shift @section;
+   $timeleft{$jid} = shift @section;
+
+   #$cwd{$jid} = shift @section;
+   #$script{$jid} = shift @section;   # Don't need, and had a space in once
+   $state{$jid} = shift @section;
+   if( $state{$jid} eq 'R' ) { 
+      $state{$jid} = "run";
+      if( $gpus{$jid} ) {
+         $gpu_sum{$user{$jid}} += $gpus{$jid};
+      }
+   }
+
+   $priority{$jid} = shift @section;
+
+   $network{$jid} = shift @section;   # Always (null)
+
+# If reason starts with launch it has 4 words, otherwise 1 word
+   $reason{$jid} = shift @section;
+
+   if( $reason{$jid} =~ "BeginTime" or $reason{$jid} =~ "held|Held" ) {
+      $held{$jid} = $reason{$jid};
+   }
+
+   $dependency{$jid} = shift @section;
+
+      # Grab the nodelist for the job and add to the job list for each host
+      # nodelist is blank for pending jobs, reqnodes is blank for running jobs
+
+   $reqnodes{$jid} = shift @section;
+
+   $next = shift @section;
+   if( length($next) >= 4000 ) {
+      die "The nodelist from squeue is greater than 4000, edit kstat to fix"
+   }
+
+   if( $state{$jid} =~ "PD|RH" ) {    # Pending in the queue
+      $nodelist{$jid} = "queue";
+   } else {
+      $nodelist{$jid} = $next;
+   }
+
+   foreach $host ( &get_hostnames( $nodelist{$jid} ) ) {
+      $jids{$host} .= "$jid ";
+      $users{$host} .= "$user{$jid} ";
+   }
+
+      # Sum the core usage for each user
+
+   if( $state{$jid} =~ "PD|RH" ) {    # Pending in the queue
+      if( $jid_a{$jid} =~ "-|," ) {    # Array job with a range or multiples
+         foreach $j ( split(',', $jid_a{$jid} ) ) {
+            if( $j =~ '-' ) {
+               ($lo, $hi) = ( $jid_a{$jid} =~ /(\d+)-(\d+)/ );
+               $qcores{$user{$jid}} += $ncores{$jid} * ($hi - $lo + 1);
+            } else {
+               $qcores{$user{$jid}} += $ncores{$jid};
+            }
+         }
+      } else {
+         $qcores{$user{$jid}} += $ncores{$jid};
+      }
+      $rcores{$user{$jid}} += 0;
+   } else {    # Running or completing
+      $rjids .= "$jid ";
+      $rcores{$user{$jid}} += $ncores{$jid};
+   }
+
+} # End of loop passing over squeue
+
+
+# Use scontrol to get host mem (free, alloc, total), load, state, reason down
+#    sinfo has same info but takes ~13 minutes on Cori
+
+foreach $line ( `scontrol show nodes` ) {
+
+   if( $line =~ "NodeName" ) { ($host) = ($line =~ /^NodeName=(\S+)/g); }
+
+   if( $line =~ "CPUAlloc" ) {
+      ($cores{$host})  = ($line =~ /CPUAlloc=(\d+)/);
+      ($nc)  = ($line =~ /CPUTot=(\d+)/);
+      #($load{$host}) = ($line =~ /CPULoad=([.0-9]+)/);
+   }
+
+   if( $line =~ "RealMemory" ) {
+      ($gb_total{$host}) = ($line =~ /RealMemory=(\d+)/);
+      ($gb_alloc{$host}) = ($line =~ /AllocMem=(\d+)/);
+      ($gb_free{$host})  = ($line =~ /FreeMem=(\d+)/);
+      $gb_total{$host} /= 1000.0;
+      $gb_alloc{$host} /= 1000.0;
+      $gb_free{$host}  /= 1000.0;
+
+      if( $gb_free{$host} ) {
+         $gb = int( 10.0 * ($gb_total{$host} - $gb_free{$host}) + 0.5) / 10.0;
+         $gb_used{$host} = sprintf( "%6.1f", $gb);
+      } else {
+         $gb_used{$host} = "    ??";
+      }
+   }
+
+   ($state) = ($line =~ /State=(\S+)/);
+   if( lc($state) =~ "down" ) { $status{$host} = "$onread Down - ";
+   } elsif( lc($state) =~ "drain" ) { $status{$host} = "$onyellow Draining - "; }
+   if( $line =~ "Reason" ) {
+      ($reason) = ($line =~ /Reason=([^\[]+)/);
+      $status{$host} .= $reason;
+   }
+}
+
+
+#    Check for an upcoming maintenance period.
+
+$maint_seconds = 31536000;
+foreach $line ( `scontrol show reservations` ) {
+   if( $line =~ "ReservationName" ) {
+      ($maint_time) = ($line =~ /StartTime=(\S+)/);
+   }
+   if( $line =~ "Flags" && $line =~ "MAINT" ) {
+      $now  = localtime;
+      $datetime = Time::Piece->strptime( $maint_time, '%Y-%m-%dT%H:%M:%S' );
+      if( $datetime - localtime->tzoffset() > $now ) {
+         $maint_seconds = $datetime - localtime->tzoffset() - $now;
+         $maint_msg = $maint_time;
+         $maint_hours = int($maint_seconds / 3600);
+      }
+   }
+}
+
+
+# Now clean up the queue of OSG jobs if needed
+
+if( $osg_show_jobs ne "yes" ) {
+   foreach $jid ( split(' ',$jids{"queue"}) ) {
+      if( $user{$jid} =~ "$osg_user_name" ) {
+         $jids{"queue"} =~ s/$jid//;   # Zero the OSG job
+      }
+   }
+}
+
+
+# Parse sacct to get all or some jobs for a user in the last # days
+
+sub sacct {
+
+   if( $sjids ) {
+      if( ! $days_ago ) { $days_ago = 120; }
+      $sacct_params = " --jobs=$sjids";
+   } else {
+      if( ! $susers ) { $susers = $me; }
+      $sacct_days = "for $days_ago days";
+   }
+   if( $susers ) { $sacct_users = "-u $susers"; }
+
+   $sacct_format = "--format=JobIDRaw,MaxRSS,JobName,NodeList," .
+                            "NNodes,ReqCPUs,ReqMem,Elapsed,State";
+                            #"AllocNodes,AllocCPUs,ReqMem,Elapsed,State";
+## DDT - Slurm bug with ReqNodes and --units=G
+
+   $now = Time::Piece->new;
+   $ago = $now - ($days_ago * ONE_DAY);
+   $sacct_command = sprintf( "sacct -n -P -D --units=G -S %s %s %s %s", 
+                 $ago->datetime, $sacct_params, $sacct_users, $sacct_format);
+
+   $line = sprintf "  sacct %s %s %s  ", $sacct_users, $sacct_params, $sacct_days;
+   $len = ( 90 - length( $line ) ) / 2;
+   printf "\n$green" . "#"x$len .$yellow.$line.$green. "#"x$len ."$reset\n";
+   printf $green . ' 'x38 . "max gb used on a node /   gb requested per node$reset\n";
+
+   $count = 0;
+   foreach $line (`$sacct_command`) {
+      chomp( $line );
+
+      @section = split('\|', $line);
+
+      $jidsteps = shift @section;                # Job ID and possible steps
+      $jid = (split( '\D', $jidsteps ) )[0];     # Job ID without steps
+      if( $jidsteps !~ '\.' ) { $count++; }  # New job so inc count
+      $jid = "$jid-$count";      # append a count to make dup IDs unique
+
+      $mem = shift @section;
+      ($maxrss) = ($mem =~ /([.0-9]+).*/);
+      if( ! $maxmem{$jid} || $maxrss > $maxmem{$jid} ) {   # Take max of all steps
+         $maxmem{$jid} = $maxrss;
+      }
+
+      if( $jidsteps !~ '\.' ) {   # New job line so save the info
+         $sacct_jids .= "$jid ";
+         $jobname{$jid}  = shift @section;
+         $nodelist{$jid} = shift @section;
+         if( $nodelist{$jid} =~ "None assigned" ) { $nodelist{$jid} = "Queue"; }
+         $nnodes{$jid}   = shift @section;
+         if( $nnodes{$jid} == 0 ) { $nnodes{$jid} = 1; }
+         $ncores{$jid}   = shift @section;
+#if( $ncores{$jid} == 0 ) { printf "2 ncores($jid) $ncores{$jid}\n"; $ncores{$jid} = -1; }
+         $word           = shift @section;
+         ($mem) = ($word =~ /([.0-9]+).*/);
+         if( $word =~ 'c' ) {
+            $reqmempernode{$jid} = $mem * $ncores{$jid};
+            #$reqmempernode{$jid} = $mem * $ncores{$jid} / $nnodes{$jid};
+         } else {
+            $reqmempernode{$jid} = $mem;
+         }
+         $runtime{$jid}  = shift @section;
+         $state{$jid}    = shift @section;
+         $state{$jid}  = (split(' ', $state{$jid} ) )[0];
+      }
+   }
+
+   foreach $jid ( split( ' ', $sacct_jids ) ) {
+
+      $jm = (split( '-', $jid))[0];
+      printf "  %-7s  %-10s  ", $jm, substr( $jobname{$jid}, 0, 10);
+
+      $color = &hostcolor( $nodelist{$jid} );
+      printf "%s%-15s  ", $color, $nodelist{$jid};
+
+      if( $nnodes{$jid} > 1 ) { $color = $magenta; } else { $color = $reset; }
+      printf "%s%2d n %3d c  ", $color, $nnodes{$jid}, $ncores{$jid};
+
+      $color = $reset;
+      if( $maxmem{$jid} && $reqmempernode{$jid} > 128 && $state{$jid} =~ "COMPLETED" ) {
+         if( $maxmem{$jid} < 0.50 * $reqmempernode{$jid} ) { $color = $yellow; }
+         if( $maxmem{$jid} < 0.20 * $reqmempernode{$jid} ) { $color = $onyellow; }
+         if( $maxmem{$jid} < 80 ) { $color = $onyellow; }
+      }
+      if( $maxmem{$jid} > 0.80 * $reqmempernode{$jid} ) { $color = $red; }
+      if( $maxmem{$jid} > 0.98 * $reqmempernode{$jid} ) { $color = $onred; }
+      if( $maxmem{$jid} ) {
+         printf "%s%6sgb/", $color, $maxmem{$jid};
+      } else {
+         printf "        /";
+      }
+      printf "%3sgb  ", $reqmempernode{$jid};
+
+      if( $state{$jid} =~ "TIMEOUT" ) { $color = $onred; } else { $color = $reset; }
+      printf "%s%10s  ", $color, $runtime{$jid};
+
+      $color = $reset;
+      if( $state{$jid} =~ "TIMEOUT" )   { $color = $onred; }
+      if( $state{$jid} =~ "FAIL"      ) { $color = $onred; }
+      if( $state{$jid} =~ "PREEMPTED" ) { $color = $yellow; }
+      if( $state{$jid} =~ "CANCELLED" ) { $color = $red; }
+      if( $state{$jid} =~ "RUNNING" )   { $color = $green; }
+      if( $state{$jid} =~ "PENDING" )   { $color = $green; }
+      printf "%s%s%s\n", $color, $state{$jid}, $reset;
+   }
+   if ( scalar( $jid ) ) {
+      $path = `sacct -o WorkDir -j $jid -P | head -2 | tail -1`;
+      chomp($path);
+      printf "  Working directory - $path\n";
+   }
+   return;
+}
+
+
+# Print a summary of the core usage by each user
+
+if( $pr_cores ) {
+
+   printf("\n%s##############################   Core usage    " .
+          "###############################%s\n\n", $cyan, $reset);
+
+   foreach $u ( sort keys %rcores ) { 
+      $rsum += $rcores{$u}; 
+      $qsum += $qcores{$u}; 
+   }
+
+   foreach $u ( sort keys %rcores ) {
+
+      if( $rsum > 0 ) {  $percent = 100.0 * $rcores{$u} / $rsum; }
+      if( $qsum > 0 ) { $qpercent = 100.0 * $qcores{$u} / $qsum; }
+
+      $color = $reset;
+      if( $percent >  5.0 ) { $color = $yellow; }
+      if( $percent > 10.0 ) { $color = $red; }
+      if( $u eq $me       ) { $color = $green; }
+      if( $u eq "$osg_user_name" ) { $color = $gray; }
+
+      $qcolor = $reset;
+      if( $u eq $me           ) { $qcolor = $green; }
+      if( $qcores{$u} >  1000 ) { $qcolor = $yellow; }
+      if( $qcores{$u} > 10000 ) { $qcolor = $red; }
+      if( $u eq "$osg_user_name" ) { $qcolor = $gray; }
+
+      if( $pr_names eq "full names") {
+         printf "   %s%-22s  %6d cores   %%%4.1f used%s   %s%7d cores queued%s\n",
+               $color, $uname{$u}, $rcores{$u}, $percent, $reset,
+               $qcolor, $qcores{$u}, $reset;
+      } elsif( $pr_names eq "no names") {
+         printf "   %s%-12s  %6d cores   %%%4.1f used%s   %s%7d cores queued%s\n",
+               $color, $uname{$u}, $rcores{$u}, $percent, $reset,
+               $qcolor, $qcores{$u}, $reset;
+      } else {
+         printf "   %s%-12s  %6d cores   %%%4.1f used%s   %s%7d cores queued%s\n",
+               $color, $u, $rcores{$u}, $percent, $reset,
+               $qcolor, $qcores{$u}, $reset;
+      }
+
+   }
+   printf "%s                %7d cores used          %8d cores queued%s\n", 
+          $cyan, $rsum, $qsum, $reset;
+
+      # Now print out a summary of the GPU usage
+
+   printf("\n\n%s##############################   GPU usage     " .
+          "###############################%s\n\n", $green, $reset);
+
+   foreach $u ( sort keys %rcores ) { 
+      next if( ! $gpu_sum{$u} );
+
+      $gpus_used += $gpu_sum{$u};
+      $color=$reset;
+      if( $pr_names ) {
+         printf "%s   %-12s    %4d GPUs used$reset\n", $color, $uname{$u}, $gpu_sum{$u};
+      } else {
+         printf "%s   %-12s    %4d GPUs used$reset\n", $color, $u, $gpu_sum{$u};
+      }
+   }
+   printf "$cyan                   %4d GPUs used total$reset\n", $gpus_used;
+   exit;
+}
+
+
+
+# Now print out the host and job information
+
+if( $system =~ "Beocat" ) {   # Sort nodes oldest to newest
+   @hosts = @hostlist;
+   @hostlist = ();
+   foreach $host ( sort @hosts ) { if( $host =~ "mage"   ) { push @hostlist, $host; }}
+   foreach $host ( sort @hosts ) { if( $host =~ "elf"    ) { push @hostlist, $host; }}
+   foreach $host ( sort @hosts ) { if( $host =~ "hero"   ) { push @hostlist, $host; }}
+   foreach $host ( sort @hosts ) { if( $host =~ "dwarf"  ) { push @hostlist, $host; }}
+   foreach $host ( sort @hosts ) { if( $host =~ "mole"   ) { push @hostlist, $host; }}
+   foreach $host ( sort @hosts ) { if( $host =~ "gremlin") { push @hostlist, $host; }}
+   foreach $host ( sort @hosts ) { if( $host =~ "wizard" ) { push @hostlist, $host; }}
+   foreach $host ( sort @hosts ) { if( $host =~ "warlock") { push @hostlist, $host; }}
+} else {
+   @hosts = @hostlist;
+   @hostlist = ();
+   foreach $host ( sort @hosts ) { push @hostlist, $host; }
+}
+if( $pr_queued ) { push @hostlist, "queue"; }
+
+foreach $host ( @hostlist ) {
+
+# Choose only nodes that match the searchable user, id, prog, and hosts given
+
+   if( $shosts ) {      # Check for a match in $shosts
+      $matches = 0;
+      foreach $try ( split(' ',$shosts) ) {
+         if( $host =~ $try ) { $matches ++; }
+      }
+      next if( $matches == 0 );  # Skip this host if no matches
+   }
+
+   if( $susers ) {
+      $matches = 0;
+      foreach $try ( split(' ',$susers) ) {
+         if( $users{$host} =~ $try ) { $matches ++; }
+      }
+      next if( $matches == 0 );  # Skip this host if no users match
+   }
+
+   if( $sjids ) {
+      $matches = 0;
+      foreach $try ( split(',',$sjids) ) {
+         if( $jids{$host} =~ $try ) { $matches ++; }
+      }
+      next if( $matches == 0 );  # Skip this host if no Job ID's match
+   }
+
+   if( $sprogs ) {
+      $matches = 0;
+      foreach $try ( split(' ',$sprogs) ) {
+         if( $progs{$host} =~ $try ) { $match ++; }
+      }
+      next if( $matches == 0 );  # Skip this host if no program names match
+   }
+
+
+   if( $host eq "queue" ) {
+
+      printf("\n%s##################################   $system_name Queue    " .
+             "###################################%s\n", $green, $reset);
+
+      if( $maint_msg ) {
+         printf("%s                  %s         %s\n",
+                $onyellow, "Maintenance period on " . $maint_msg .
+                "    (" . $maint_hours . " hours away)",  $reset);
+         printf("%s#####################################################".
+                "###################################%s\n", $green, $reset);
+      }
+
+   } elsif( $pr_hosts ) {
+
+         # Get the host and job information from the database
+
+      &get_db_info( $host );   # Get info stored by kstat.proc.db on each node
+
+      if( $pr_gpus ) {
+         next if $pr_gpus eq "all" and not $gpu_type{$host};
+         ($gpugb) = ($pr_gpus =~ /(\d+)gb/);
+         #printf "$host $gpugb $gpu_total_mem{$host} ";
+         #printf $gpu_total_mem{$host} / 1000.0;
+         #printf "\n";
+         next if $pr_gpus =~ "gb" and $gpugb >= int($gpu_total_mem{$host}/1000.0);
+         next if $pr_gpus !~ "all" and $pr_gpus !~ "gb" and $gpu_type{$host} !~ $pr_gpus;
+      }
+
+         # Skip host if requested to only print info for a given owner's nodes
+
+      next if( $pr_owner and 
+               lc($owner{$host}) !~ lc($pr_owner) and
+               lc($owner{$host}) !~ lc($pr_owner_chem_mri) );
+
+# Print the host name colorized
+
+      if     ( $reserved{$host}   ) { $color = $onyellow;
+      #} elsif( $status{$host}     ) { $color = $onred;
+      #} elsif( $owner{$host}      ) { $color = $red;
+      } else { $color = &hostcolor($host); }
+      printf "%s%s%s", $color, ucfirst($host), $reset;
+      if( length( $host ) < 14 ) { printf ' ' x (14 - length($host) ); }
+
+# Print the cores used and total number of cores
+
+      if( $status{$host} && $status{$host} =~ "Down" ) {
+         $nodes_down ++;
+      } else {
+         $total_cores += $ncores{$host};
+         $used_cores  += $cores{$host};
+         foreach $jid ( split(' ',$jids{$host}) ) {
+            if( $user{$jid} =~ "$osg_user_name" ) {   # Subtract off core count
+               if( $osg_show_jobs eq "yes" ) {
+                  $osgcores += $ncores{$jid};
+               } else {
+                  $used_cores -= $ncores{$jid};
+                  $cores{$host} -= $ncores{$jid};   # Subtract off core count
+                  $jids{$host} =~ s/$jid//;   # Zero the OSG job
+               }
+            }
+         }
+      }
+
+      $color = $reset . $yellownorm;
+      if( $owner{$host} ) { $color = $rednorm; }
+      if( $cores{$host} > 0 ) { $color = $cyan; }
+      if( $cores{$host} == $ncores{$host}) { $color = $blue; }
+      if( $cores{$host} > $ncores{$host}) { $color = $onredblink; }   # SGE error
+      if( $status{$host} =~ "Down" ) { $color = $reset; }
+      if( $ngpus{$host} eq "1" ) {
+         printf "%s%3d of %3d c%s+%s1GPU%s   ",
+               $color, $cores{$host},$ncores{$host},$reset, $green, $reset;
+      } elsif( $ngpus{$host} ) {
+         printf "%s%3d of %3d c%s+%s%sGPUs%s  ",
+            $color, $cores{$host}, $ncores{$host}, $reset, $green, $ngpus{$host}, $reset;
+      } else {
+         printf "%s%3d of %3d cores%s    ",
+               $color, $cores{$host},$ncores{$host},$reset;
+      }
+
+# Print the load level, yellow for under utilized, red for over utilized
+
+      $color = $reset;
+      if( $cores{$host} > 0 ) {
+         if( $load{$host} / $cores{$host}  < 0.5 ){$color = $yellow;}
+         if( $load{$host} / $cores{$host}  < 0.25){$color = $onyellow;}
+      }
+      if( $load{$host} > $ncores{$host} * 2.0 ) { $color = $red; }
+      if( $load{$host} > $ncores{$host} * 10.0 ) { $color = $onred; }
+
+      if( $load{$host} =~ "-NA-" ) {
+         print "                  ";
+      } else {
+         printf "%sLoad %4d / %3d%s    ",
+               $color, int( 0.5+$load{$host}), $ncores{$host}, $reset;
+      }
+
+# Print status for bad nodes or memory usage for good nodes
+
+      if( $status{$host} ) {
+         printf "%s%s%s", $onred, $status{$host}, $reset;
+
+      } else {       # Print the host memory usage
+
+         $color = $reset;
+         if ( not exists( $node_metrics_date{$host} ) ) {   # No data in 5 minutes
+            printf "${onorange}kstat.proc.db down$reset";
+         } else {
+            printf "%s%4d/%4d/%4d GB%s ", $mem_color{$host}, 
+                  $mem_used{$host}, $mem_alloc{$host}, $mem_total{$host}, $reset;
+         }
+
+# Print owner if asked, or swap if > 1 GB, or queue time limit
+
+         if( $status{$host} =~ "Disabled" ) {
+            printf " %s%s%s", $red, $status{$host}, $reset;
+         } elsif( $gb_swap{$host} >= 1.0 ) {
+            $color = $yellow;
+            if( $gb_swap{$host} >= 10.0 ) { $color = $onred; }
+            printf " %s%d GB swap%s", $color, $gb_swap{$host}, $reset;
+         } elsif( $reserved{$host} ) {
+            printf " %s%s%s", $onyellow, $reserved{$host}, $reset;
+         } elsif( $hourlimit{$host} ) {
+            printf " %s%d hrs max%s", $red, $hourlimit{$host}, $reset;
+         } elsif( $owner{$host} ) {
+            printf " %s%s%s", $orange, $owner{$host}, $reset;
+         }
+      }
+      print "\n";
+
+      if( $pr_longlist ) {
+         if( $llist{$host} ) { printf "      $llist{$host}\n"; }   # AVX, networks, disk
+
+               # Print CPU usage for this host
+
+         printf "%s      CPU usage     %s%5.1f%% user   %s%5.1f%% system   %s%5.1f%% ".
+               "idle   %s%5.1f%% IO wait\n", $blue, $green, $cpu_user, $yellow,
+               $cpu_sys, $red, $cpu_idle, $cyan, $cpu_wait;
+
+         printf "$reset\n";
+      }
+   }
+
+
+# Now print the jobs for this host if requested
+
+   if( $pr_jobs ) {
+
+      next if( $pr_owner and lc($owner{$host}) !~ lc($pr_owner) and $host !~ "queue" );
+
+      foreach $jid ( split(' ',$jids{$host}) ) {
+
+         next if( $host =~ "queue" and $pr_owner and lc($partition{$jid}) !~ lc($pr_owner) );
+
+         #($id) = ( $jid =~ /(\d+)/ );
+         if( $host eq "queue" ) {
+            next if( $susers and $susers !~ $user{$jid} );   # Only select users
+            next if( $sjids  and $sjids  !~ $jid );           # Only select Job IDs
+         }
+
+         $color = $white;
+         if( $user{$jid} eq $me ) { $color = $green; }
+         if( $susers =~ $user{$jid} ) { $color = $green; }
+         if( $user{$jid} =~ "$osg_user_name" ) { $color = $gray; }
+         if( $pr_names ) {
+            printf(" %s%-10s%s  ", $color, substr( $uname{$user{$jid}}, 0, 20), $reset);
+         } else {
+            printf(" %s%-10s%s  ", $color, substr( $user{$jid}, 0, 10), $reset);
+         }
+         if( $prog{$jid} =~ "OnDemand" ) {
+            printf("%-10s  ", $brown . "OnDemand  " . $reset );
+         } else {
+            $color = $white;
+            if( $nnodes{$jid} > 1 ) { $color = $magenta; }
+            printf("$color%-10s  $reset", (substr $prog{$jid}, 0, 10));
+         }
+         $color = $white;
+         if( $jid_a{$jid} =~ "_|-" ) { $color = $purple; }
+         if( $host =~ "queue" ) {
+            printf("$color%s  ", $jid_a{$jid});
+         } else {
+            printf("$color%s  ", $jid);
+         }
+
+         $color = $cyan;
+         if( $ncores_on_host{$host.$jid} == $ncores{$host} ) { $color = $blue; }
+         if( $contiguous{$jid} != 0 ) { $color = $yellow; }
+         if( $host =~ "queue" ) {
+            if( $nnodes{$jid} != $nnodes_tres{$jid} ) {   # Cores specified with --nasks=
+                                                          # This doesn't catch all though
+               printf("%s%3d ntasks%s  ", $magenta, $ncores{$jid}, $reset);
+            } elsif( $nnodes{$jid} == 1 ) {
+               printf("%s%3d cores%s   ", $color, $ncores{$jid}, $reset);
+            } else {
+               $str = sprintf("%dn%dc  ", $nnodes{$jid}, $ncores{$jid}/$nnodes{$jid});
+               printf("%s%11s%s ", $magenta, $str, $reset);
+            }
+
+         } elsif( $gpus{$jid} ) {
+            printf("$color%3s c+$green%dgpu$reset ", 
+                    $ncores_on_host{$host.$jid}, $gpus{$jid});
+
+         } else {
+            ($days, $hours, $minutes, $secs_run) = &dhm_totsecs( $runtime{$jid} );
+            if( ! exists( $ncores_on_host{$host.$jid} ) and $secs_run gt 120 ) {
+               printf("${onred}no cores being used$reset  ");
+            } else {
+               printf("$color%3s cores$reset  ", $ncores_on_host{$host.$jid});
+            }
+         }
+
+         $color = $green;
+         if( $host =~ "queue" ) {
+
+               # In Queue print status, req hours and memory, time, and constraints
+
+            ($d, $h, $m, $req_seconds) = &dhm_totsecs( $reqtime{$jid} );
+            $req_hours = int( ($req_seconds / 3600) + 0.5);
+            if( $killable{$jid} =~ "killable" ) { $color = $red; }
+            if( $held{$jid} ) { $color = $onyellow; }
+            if( $state{$jid} =~ "RH" ) { $color = $onred; }
+            if( $user{$jid} =~ "$osg_user_name" ) { $color = $gray; }
+            if( $req_seconds >= $maint_seconds ) {
+               $mc = $onyellowblink;
+            } else {
+               $mc = "";
+            }
+            if( $held{$jid} =~ "held|Held" ) {
+               printf( "$color%2s - held$reset $mc%3s h$reset ",$state{$jid}, $req_hours);
+            } elsif( $dependency{$jid} && $dependency{$jid} !~ "(null)" ) {
+               printf( "$onyellow%2s - dep %s$reset $mc%3s h$reset ", 
+                        $state{$jid}, $dependency{$jid}, $req_hours);
+            } else {
+               printf( "$color%2s$reset $mc%3s h$reset ", $state{$jid}, $req_hours);
+            }
+
+            if( $nnodes{$jid} > 1 ) { $color = $magenta; } else { $color = $white; }
+            if( $reqmem{$jid} ) { printf ("$color%8s$reset ", $reqmem{$jid}) };
+
+         } else {
+
+            if( $jid =~ '_' ) { $color = $purple; }  # Underscore means array job
+            if( $killable{$jid} =~ "killable" ) { $color = $red; }
+            if( $state{$jid} !~ "run" ) { $color = $onred; }
+            if( $user{$jid} =~ "$osg_user_name" ) { $color = $gray; }
+            printf( "$color%-8s  $reset", $state{$jid} );
+
+            $color = $white;
+            ($mem) = ($reqmem{$jid} =~ /(\d+)/);
+            if( $nnodes{$jid} > 1 ) { $color = $magenta; }
+            $j = (split('_',$jid))[0];   # Just use job ID, not task ID
+            $swap = "";
+            if(   $reqmem{$jid} and $ncores{$jid} > 0 and
+                  $mem > 4.0 * $ncores_on_host{$host.$jid} ) {
+               $mem = int( $mem * $ncores_on_host{$host.$jid} / $ncores{$jid} + 0.5);
+               if( $mem < 1 ) { $mem = 1; }
+               if( $jobmaxmem{$host.$j} and $jobmaxmem{$host.$j}/$mem < 0.20 and
+                   $mem > 10 and
+                   $ncores_on_host{$host.$jid} != $ncores{$host} ) { $color = $onyellow; }
+               if( $jobmaxmem{$host.$j}/$mem > 0.90 ) { $color = $red; }
+#printf ("\nswqp $jobswapmem{$host.$j} $jobswapmax{$host.$j}\n" );
+               if( $jobmaxmem{$host.$j} > 0.1 and $jobswapmem{$host.$j} > 1.0 ) {
+                  $color = $onred;
+                  $swap = " disk swapping";
+# DDT - max swap is not reliable
+               #} elsif ( $jobmaxmem{$host.$j} > 0.1 and $jobswapmax{$host.$j} > 1.0 ) {
+                  #$color = $onyellow;
+                  #$swap = " some disk swap";
+               }
+            }
+            if( $prog{$jid} =~ "OnDemand" and $color eq $onyellow ) {
+               $color = $brown;
+            }
+            printf ("$color%4d/%4d gb req %s$reset  ",int($jobmem{$host.$j}+0.5),$mem,$swap);
+         }
+
+            # Print the run time or the time waiting in the queue
+
+         $color = $white;
+         if( $host eq "queue" ) {
+
+            ($days, $hours, $minutes, $sub_secs) = &dhm_totsecs( $submittime{$jid} );
+            if( $sub_secs >= 12*3600  ) { $color = $yellow; }
+            if( $sub_secs >= 24*3600  ) { $color = $red; }
+            if( $sub_secs >= 7*24*3600  ) { $color = $onred; }
+
+         } else {  # Get runtime in d h m and colorize when close to hard time limit
+
+            ($days, $hours, $minutes, $secs_run) = &dhm_totsecs( $runtime{$jid} );
+            ($d, $h, $m, $secs_left)             = &dhm_totsecs( $timeleft{$jid} );
+            $total_secs = $secs_run + $secs_left;
+
+            if( $secs_left > 10000 ) {
+               if( $secs_run / $total_secs >= 0.90 ) { $color = $red;
+               } elsif( $secs_run / $total_secs >= 0.75 ) { $color = $yellow;
+               }
+            }
+         }
+
+         printf( "%s%2d d %2d h %2d m%s  ", $color, $days, $hours, $minutes, $reset);
+
+            # Print the requested features
+
+         if( $host eq "queue" ) {
+
+            if( $gpus{$jid} == 1 ) { printf( "$green$gpus{$jid} $gpu_type{$jid} GPU "); }
+            elsif( $gpus{$jid}   ) { printf( "$green$gpus{$jid} $gpu_type{$jid} GPUs "); }
+
+            if( $features{$jid} ) { printf( "$blue$features{$jid} "); }
+            if( $fabric{$jid}   ) { printf( "$blue$fabric{$jid} "); }
+            if( $reqtmp{$jid}   ) { printf( "$blue$reqtmp{$jid} "); }
+
+            if( $partition{$jid} ) { printf( "$orange$partition{$jid} "); }
+            if( $reqnodes{$jid}  ) { printf( "$green$reqnodes{$jid} "); }
+
+            printf( "$reset");
+         }
+
+            # Print the node list as sw#(#N),sw#(#N),...
+
+         printf("\n");
+
+         if( $pr_longlist and $host !~ "queue" ) {
+
+            if( $nnodes{$jid} > 1 ) { &print_nodelist( $nodelist{$jid} ); }
+
+            if( $jobmem{$host.$jid} ) {
+               printf "     %s Memory  %7.3f GB current with %7.3f GB maximum\n",
+                  $orange, $jobmem{$host.$jid}, $jobmaxmem{$host.$jid};
+            }
+
+               # Print CPU usage for this job
+
+            ($days, $hours, $minutes, $secs_run) = &dhm_totsecs( $runtime{$jid} );
+               $color = $blue;
+               if( $jobcpu_user{$jid} < 75.0 ) { $color = $onyellow; }
+               if( $jobcpu_user{$jid} < 50.0 ) { $color = $onred; }
+               printf "      %sCPU usage%s     %5.1f%% user   %s%5.1f%% system   " .
+                     "%s%5.1f%% idle   %s%5.1f%% IO wait\n", $color, $reset.$green, 
+                     $jobcpu_user{$jid}, $yellow, $jobcpu_sys{$jid}, $red, 
+                     $jobcpu_idle{$jid}, $cyan, $jobcpu_wait{$jid};
+
+            printf("$reset");
+
+               # Print GPU info if present
+
+            foreach $gnum ( split( ' ', $gpu_nums{$jid} ) ) {
+               printf "$green      GPU %1d %-20s   $blue%3d %% utilization  $orange%5d/%5d MiB used\n",
+                  $gnum, $gpu_type{$jid.$gnum}, $gpu_util{$jid.$gnum},
+                  $gpu_mem_used{$jid.$gnum}, $gpu_mem_total{$jid.$gnum};
+            }
+
+            printf("$reset\n");
+         }
+      }
+   }
+}
+printf "\n";
+
+
+
+# Dump the sacct and scontrol info for any Job IDs requested
+#     Must skip all but the main Array Task ID for scontrol
+
+foreach $jobid ( split( ',', $sjids ) ) {
+
+   &sacct();
+
+   ($jid) = ( $jobid =~ /(\d+)/ );    # Just in case a task ID was used
+   if( $state{$jobid} =~ "run|PD|RH" ) {
+      foreach $line ( `scontrol show job=$jid` ) {
+         if( $line =~ "JobId" ) {
+            ($this_jid) = ($line =~ /JobId=(\d+)/);
+         }
+         next if( $this_jid != $jid );  # Only use the main jid for pending array jobs
+
+         if( $line =~ "Command" ) {    # DDT - This will fail for spaces in dir  name
+            ($script) = ($line =~ /Command=(\S+)/);
+            #($script) = ($line =~ /Command=(.+)$/);
+            #$script =~ s/ /\\ /g;     # Escape any spaces in the directory name
+         }
+         if( $line =~ "WorkDir" ) {
+            ($workdir) = ($line =~ /WorkDir=(\S+)/);
+            if( $script =~ "^\.\/" ) {
+               $script =~ s/^\.//;
+               $script = $workdir . $script;
+            } elsif( $script !~ "^\/" and $script !~ "^\~" ) {
+               $script = $workdir . "/" . $script;
+            }
+         }
+
+         next if( $line =~ "Power=" );
+         $line =~ s/JobId=(\d+)/JobId $green$1$reset /;
+         $line =~ s/JobName=(\S+)/Job Name  $blue$1$reset/;
+         $line =~ s/UserId=([a-z0-9]+)(\S+)/UserId=$green$1$reset/;
+         if( $line =~ "JobState" ) {
+            ($jobstate) = ($line =~ /JobState=(\S+)/);
+         }
+         $line =~ s/JobState=([^P][^E]\S+)/Status=$green$1$reset/;
+         $line =~ s/JobState=(PENDING\s+\S+)/Status=$green$1$reset/;
+         if( $line =~ "StartTime" && $jobstate eq "PENDING" ) {
+            $line =~ s/StartTime=(\S+)/${onyellow}Estimated Start Time is $1$reset/;
+         }
+
+         $line =~ s/Partition=(\S+)/Partitions $orange$1$reset/;
+         $line =~ s/ NodeList=([^(]\S+)/ NodeList=$dgreen$1$reset/;
+         if( $line =~ "TRES" ) {
+            $line =~ s/[,=]/ /g;
+            $line =~ s/cpu (\d+) mem (\d+.)\s*node (\d+)/$pink$3$red nodes $pink$1$red cores $pink$2$red mem$reset/;
+         }
+         $line =~ s/mem=([0-9KMGT]+)/${red}mem=$pink${1}$reset/;
+         $line =~ s/TimeLimit=(\S+)/${red}TimeLimit=$pink$1$reset/;
+         #if( $line !~ "MinTmpDiskNode=0" ) {
+         $line =~ s/MinTmpDiskNode=([^0]\S*)/${red}MinTmpDiskNode=$pink$1$reset/;
+         #}
+         $line =~ s/Command=(\S+)/Slurm script  $yellow$1$reset/;
+         $line =~ s/Features=([^(]\S+)/${red}Constraint=$pink$1$reset/;
+         $line =~ s/Gres=([^(]\S+)/${red}Gres=$pink$1$reset/;
+
+         printf $line;
+         if( $line =~ "Slurm script" ) {
+            $submitline = `sacct -j $jid -o submitline -P | head -n 2 | tail -n 1`;
+            printf "   Submit line:  ${green}${submitline}$reset"
+         }
+      }
+
+      if( -B $script ) {
+         printf "Exiting since $script appears to be a binary file\n";
+         exit(0);
+      }
+
+      $command = "cat $script";
+   } else {
+      $command = "sacct -j $jid -B";
+   }
+
+   foreach $line ( `$command` ) {
+      next if( $line =~ "^[ ]*#" && $line !~ "^#!|^#SBATCH" );
+      $color = $reset . $white;
+      if( $line =~ "^#!" ) { $color = $dgreen;
+      } elsif( $line =~ "^#SBATCH" ) { $color = $yellow;
+      } elsif( $line =~ "^[ ]*mpirun|^[ ]*mpiexec " ) { $color = $magenta;
+      } elsif( $line =~ "^[ ]*perl |^[ ]*python|^[ ]*R " ) { $color = $magenta;
+      } elsif( $line =~ "^[ ]*if|^[ ]*then|^[ ]*else|^[ ]*fi" ) { $color = $blue;
+      } elsif( $line =~ "^[ ]*for|^[ ]*do|^[ ]*done|^[ ]*while|^[ ]*until" ) { $color = $blue;
+      } elsif( $line =~ "^[ ]*echo |^ls |^du " ) { $color = $orange;
+      } elsif( $line =~ "^[ ]*module load |^[ ]*module purge" ) { $color = $purple;
+      } elsif( $line =~ "^[ ]*module list|[ ]*module avail" ) { $color = $orange;
+      } elsif( $line =~ "^[ ]*cd |^[ ]*exit|^[ ]*ulimit |^[ ]*export " ) { $color = $red;
+      } elsif( $line =~ "^[ ]*mv |^[ ]*time |^[ ]*tar " ) { $color = $red;
+      } elsif( $line =~ "^[ ]*read " ) { $color = $red;
+      } elsif( $line =~ "^[a-zA-Z0-9_]+=" ) { $color = $red;
+      } elsif( $line =~ "^[ ]*ln|^[ ]*unlink|^[ ]*mkdir|^[ ]*cp" ) { $color = $red;
+      }
+      $line =~ s/%/%%/g;
+      printf "$color$line$reset";
+   }
+   printf "$reset\n\n";
+}
+
+
+
+# Dump the overall usage stats
+
+if( $total_cores > 0 ) {
+   $percent = 100.0 * ($used_cores-$osgcores) / $total_cores;
+   printf "\n   %4d of %4d working cores ( %%%4.1f ) in use for $system_name jobs " .
+          "with %d nodes down\n", 
+           ($used_cores-$osgcores), $total_cores, $percent, $nodes_down;
+   #if( $osg_user_name and ! $susers and ! $shosts and ! $sjids) {
+   if( $osg_user_name and $osg_show_jobs eq "yes" ) {
+      $percent = 100.0 * $osgcores / $total_cores;
+      printf "$gray   %4d of %4d working cores ( %%%4.1f ) in use for " .
+            "background Open Science Grid jobs$reset\n",
+            $osgcores, $total_cores, $percent;
+      $percent = 100.0 * ($used_cores) / $total_cores;
+      printf "   Total cluster utilization is %%%4.1f\n", $percent;
+   }
+}
+
+
+# Input of a datetime is converted to an interval from then until now
+# Convert an interval dd-hh:mm:ss where days, hours, minutes are optional
+#     into 2 returned forms (d h m) with minutes rounded and (total secs) 
+#     return:  ( $days, $hours, $minutes, $total_secs)
+
+sub dhm_totsecs {
+
+   local( $time_in ) = @_;
+
+   my $date = 0, $now = 0;
+
+   my $days = 0;
+   my $hours = 0;
+   my $minutes = 0;
+   my $seconds = 0;
+   my $total_secs = 0;
+
+   if( $time_in =~ 'T' ) {  # If a date convert into interval from now in seconds
+
+      $now  = localtime;   # Also tried new
+      $date = Time::Piece->strptime( $time_in, '%Y-%m-%dT%H:%M:%S' );
+      $time_in = $now - $date + localtime->tzoffset();
+
+   }
+
+      # Handle possible days
+
+   if( $time_in =~ '-' ) {
+      $days =    ( split('-',$time_in) )[0];
+      $time_in = ( split('-',$time_in) )[1];
+   }
+
+      # Handle possible hours
+
+   @section = split(':', $time_in);
+
+   if( $#section == 2 ) {        # Handle hh:mm:ss
+
+      $hours = $section[0];
+      $minutes = $section[1];
+      $seconds = $section[2];
+
+   } elsif( $#section == 1 ) {   # Handle mm:ss
+
+      $minutes = $section[0];
+      $seconds = $section[1];
+
+   } else {                      # Only seconds
+
+      $seconds = $section[0];
+
+      $days = int( $seconds / (24 * 3600) );
+      $seconds -= $days * 24 * 3600;
+
+      $hours = int( $seconds / 3600 );
+      $seconds -= $hours * 3600;
+
+      $minutes = int( $seconds / 60 );
+      $seconds -= $minutes * 60;
+
+   }
+
+   $total_secs = ( ($days * 24 + $hours) * 60 + $minutes) * 60 + $seconds;
+   # $minutes += int( ($seconds + 30) / 60);   # Round the minutes up
+
+   return ($days, $hours, $minutes, $total_secs);
+}
+

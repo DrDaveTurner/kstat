@@ -1,0 +1,2 @@
+sacct -o workdir -j # -P
+sacct -B -j #       To get job script

@@ -1,0 +1,14 @@
+Postgres database creds:
+
+user: kstat
+
+password: rigid-headway-fountain
+#password: JwHS6vnw7LhjfUxsEFHzmRgB
+
+host: ganymede.beocat.ksu.edu
+host: storage01.beoshock.wichita.edu
+
+port: 5432
+
+database: kstat_info
+

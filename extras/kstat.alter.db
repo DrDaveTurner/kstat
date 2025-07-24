@@ -1,0 +1,95 @@
+#!/usr/bin/env perl
+
+# kstat is being developed by Dave Turner at Kansas State University
+# Fall 2014 - current  Email: DrDaveTurner@gmail.com
+# This is free software distributed under the GPLv3 license
+
+# perl DBI version to initialize cluster hardware into kstat_info PostgreSQL database
+
+use 5.6.0;
+no strict 'vars';   # Yell all you want, it's a preference thing.
+use DBI;
+
+$operation = $ARGV[0];
+
+$dbh = DBI->connect('dbi:Pg:dbname=kstat_info;host=ganymede.beocat.ksu.edu','kstat','rigid-headway-fountain',{AutoCommit=>1,RaiseError=>1,PrintError=>0});
+
+
+#$sth = $dbh->prepare("ALTER TABLE node_metrics ADD cpu_load real");
+#$sth->execute() or die $DBI::errstr;
+#$sth->finish();
+#$sth = $dbh->prepare("ALTER TABLE node_metrics ADD cpu_user real");
+#$sth->execute() or die $DBI::errstr;
+#$sth->finish();
+#$sth = $dbh->prepare("ALTER TABLE node_metrics ADD cpu_system real");
+#$sth->execute() or die $DBI::errstr;
+#$sth->finish();
+#$sth = $dbh->prepare("ALTER TABLE node_metrics ADD cpu_idle real");
+#$sth->execute() or die $DBI::errstr;
+#$sth->finish();
+
+$sth = $dbh->prepare("ALTER TABLE job_metrics DROP mem_used");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics DROP max_mem_used");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics DROP cpu_user");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics DROP cpu_system");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics DROP cpu_idle");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics DROP io_wait");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics DROP swap_mem_used");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics DROP swap_mem_max");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics DROP job_ncores");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+
+$sth = $dbh->prepare("ALTER TABLE job_metrics ADD job_ncores integer");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics ADD cpu_user real");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics ADD cpu_system real");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics ADD cpu_idle real");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics ADD cpu_io real");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics ADD mem_used real");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics ADD max_mem_used real");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics ADD swap_mem_used real");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+$sth = $dbh->prepare("ALTER TABLE job_metrics ADD max_swap_mem_used real");
+$sth->execute() or die $DBI::errstr;
+$sth->finish();
+
+
+#$sth = $dbh->prepare("ALTER TABLE job_metrics ADD job_ncores integer");
+#$sth->execute() or die $DBI::errstr;
+#$sth->finish();
+
+#$sth = $dbh->prepare("ALTER TABLE job_metrics ADD swap_mem_max float");
+#$sth->execute() or die $DBI::errstr;
+#$sth->finish();
+

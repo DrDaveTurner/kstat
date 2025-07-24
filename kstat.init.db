@@ -1,0 +1,315 @@
+#!/usr/bin/env perl
+
+# kstat is being developed by Dave Turner at Kansas State University
+# Fall 2014 - current  Email: DrDaveTurner@gmail.com
+# This is free software distributed under the GPLv3 license
+
+# USAGE: kstat.init.db obliterate - clean all tables
+#                      restart    - clean HW and GPU tables, del host metrics, rerun scan
+#                      rescan     - add new HW and GPU data to old
+#                      jobs       - clean job and gpu metrics tables only
+
+# perl DBI version to initialize cluster hardware into kstat_info PostgreSQL database
+#NOTE - Currently only handles 1 gpu type per node
+
+use 5.6.0;
+use lib '/homes/daveturner/.perl5/lib/perl5/site_perl/5.34.1';
+no strict 'vars';   # Yell all you want, it's a preference thing.
+use DBI;
+
+$operation = $ARGV[0];
+
+$dbh = DBI->connect('dbi:Pg:dbname=kstat_info;host=ganymede.beocat.ksu.edu','kstat','rigid-headway-fountain',{AutoCommit=>1,RaiseError=>1,PrintError=>0});
+
+
+if ( $operation =~ "obliterate" ) {   # Delete all data from all tables
+
+   printf "Deleting all tables\n";
+
+   $sth = $dbh->prepare("DELETE FROM node_metrics");
+   $sth->execute() or die $DBI::errstr;
+   $sth->finish();
+
+   $sth = $dbh->prepare("DELETE FROM job_metrics");
+   $sth->execute() or die $DBI::errstr;
+   $sth->finish();
+
+   $sth = $dbh->prepare("DELETE FROM job_gpu_metrics");
+   $sth->execute() or die $DBI::errstr;
+   $sth->finish();
+
+   $sth = $dbh->prepare("DELETE FROM node_gpus");
+   $sth->execute() or die $DBI::errstr;
+   $sth->finish();
+
+   $sth = $dbh->prepare("DELETE FROM nodes");
+   $sth->execute() or die $DBI::errstr;
+   $sth->finish();
+   
+   printf "All tables in kstat_info deleted\n";
+   exit(0);
+
+} elsif ( $operation =~ "restart" ) {   # Delete HW and maybe host metrics data, rescan
+
+   printf "Deleting node and GPU tables, then rescanning to add new\n";
+   #printf "Deleting node and GPU tables and host metrics, then rescanning to add new\n";
+
+   $sth = $dbh->prepare("DELETE FROM node_gpus");
+   $sth->execute() or die $DBI::errstr;
+   $sth->finish();
+
+   $sth = $dbh->prepare("DELETE FROM nodes");
+   $sth->execute() or die $DBI::errstr;
+   $sth->finish();
+   
+   #$sth = $dbh->prepare("DELETE FROM node_metrics");
+   #$sth->execute() or die $DBI::errstr;
+   #$sth->finish();
+
+} elsif ( $operation =~ "rescan" ) {    # Rescan to add new HW and GPU
+
+   printf "No tables deleted, rescan will add new hardware and GPUs\n";
+
+} elsif ( $operation =~ "jobs" ) {      # Delete job and gpu metrics tables
+
+   printf "Deleting job and GPU metrics data\n";
+
+   $sth = $dbh->prepare("DELETE FROM job_metrics");
+   $sth->execute() or die $DBI::errstr;
+   $sth->finish();
+
+   $sth = $dbh->prepare("DELETE FROM job_gpu_metrics");
+   $sth->execute() or die $DBI::errstr;
+   $sth->finish();
+   exit(0);
+
+} else {
+   printf "USAGE: kstat.init.db [ obliterate | restart | rescan ]\n";
+   exit(0);
+}
+
+
+   # Now add new data for hosts and GPUs not currently in the table.
+   #   For restart this means all hosts and GPUs
+   #   For rescan this means only new hosts and GPUs
+
+$slurm_conf = "/etc/slurm/slurm.conf";
+$date = `date +%FT%T`;
+#printf "Date $date\n";
+
+
+sub get_gpu_info {    # Get GPU info using nvidia-smi for a host
+   local( $host ) = @_;
+
+   if( `ssh $host '/usr/sbin/lspci -d 10de:'` ) {
+      foreach $gpu ( `ssh $host 'nvidia-smi --format=csv,noheader --query-gpu=index,name,memory.total'` ) {
+         chomp($gpu);
+
+            # Skip nodes that have no nVidia GPUs
+
+         next if ( $gpu =~ "command not found");
+         next if ( $gpu =~ "has failed" );
+         next if ( $gpu eq "" );
+
+         ($gnum, $gtype, $gmem) = ($gpu =~ /([0-9]+), ([^,]+), ([0-9]+) MiB/);
+         $gpu_mem_total{$gnum} = $gmem;
+         $gpu_type{$gnum} = $gtype;
+         $num_gpus = $gnum;
+
+
+         printf "GPU $gnum $gpu_type{$gnum} $gpu_mem_total{$gnum}\n";
+      }
+   }
+}
+
+
+sub insert_into_table {
+
+   $nodename = $_[0];
+   $cpus     = $_[1];
+   $memory   = $_[2];
+   $owner    = $_[3];
+   $ngpus    = $_[4];
+   $gpu_type = $_[5];
+   $tmp      = $_[6];
+   $date     = $_[7];
+
+   printf "INSERT $nodename $cpus $memory $owner $ngpus $gpu_type $tmp $date\n";
+
+   $sth = $dbh->prepare("INSERT INTO nodes (node_name, total_cores, total_mem, owner, gpu_count, local_disk, last_scanned ) values ( \'$nodename\', \'$cpus\', \'$memory\', \'$owner\', \'$ngpus\', \'$tmp\', \'$date\' )");
+   $sth->execute() or die $DBI::errstr;
+   $sth->finish();
+
+   if ( $ngpus > 0 ) { #insert GPU data
+
+      &get_gpu_info( $nodename );  # ssh and get total memory
+
+      $sth = $dbh->prepare("SELECT node_id FROM nodes WHERE node_name=\'$nodename\'");
+      $sth->execute() or die $DBI::errstr;
+      @row = $sth->fetchrow_array;
+      $node_id = $row[0];
+      $sth->finish();
+
+      for ( $i = 0; $i < $ngpus; $i++ ) {
+
+         next if ($gpu_mem_total{$i} !~ /^\d+$/);  # Protect against config being wrong
+
+         printf "INSERT $nodename $node_id $i $gpu_type $gpu_mem_total{$i}\n";
+
+         $sth = $dbh->prepare("INSERT INTO node_gpus (node_id, gpu_name, gpu_num, gpu_total_mem ) values ( \'$node_id\', \'$gpu_type\', \'$i\', \'$gpu_mem_total{$i}\' )");
+         $sth->execute() or die $DBI::errstr;
+         $sth->finish();
+      }
+   }
+   printf "\n";
+}
+
+
+sub update_table_entry {
+
+   $nodename = $_[0];
+   $cpus     = $_[1];
+   $memory   = $_[2];
+   $owner    = $_[3];
+   $ngpus    = $_[4];
+   $gpu_type = $_[5];
+   $tmp      = $_[6];
+   $date     = $_[7];
+
+   printf "UPDATE $nodename $cpus $memory $owner $ngpus $gpu_type $tmp $date\n";
+
+   $sth = $dbh->prepare("UPDATE nodes SET total_cores=\'$cpus\', total_mem=\'$memory\', owner=\'$owner\', gpu_count=\'$ngpus\', local_disk=\'$tmp\', last_scanned=\'$date\' WHERE node_name=\'$nodename\'" );
+   $sth->execute() or die $DBI::errstr;
+   $sth->finish();
+
+      # Get the node_id
+
+   $sth = $dbh->prepare("SELECT node_id FROM nodes WHERE node_name=\'$nodename\'");
+   $sth->execute() or die $DBI::errstr;
+   @row = $sth->fetchrow_array;
+   $node_id = $row[0];
+   printf "Node ID $node_id is for $nodename\n";
+   $sth->finish();
+
+# Mark current GPUs as stranded with gpu_num = -1
+
+   printf "STRAND $ngpus on $nodename\n";
+
+   $sth = $dbh->prepare("UPDATE node_gpus SET gpu_num=\'-1\' WHERE node_id=\'$node_id\'");
+   $sth->execute() or die $DBI::errstr;
+   $sth->finish();
+
+         # Insert GPU data
+
+   if ( $ngpus > 0 ) { 
+
+      &get_gpu_info( $nodename );
+
+      for ( $i = 0; $i < $ngpus; $i++ ) {
+
+         next if ($gpu_mem_total{$i} !~ /^\d+$/);  # Protect against config being wrong
+
+         printf "INSERT $nodename $node_id $i $gpu_type $gpu_mem_total{$i}\n";
+
+         $sth = $dbh->prepare("INSERT INTO node_gpus (node_id, gpu_name, gpu_num, gpu_total_mem ) values ( \'$node_id\', \'$gpu_type\', \'$i\', \'$gpu_mem_total{$i}\' )");
+         $sth->execute() or die $DBI::errstr;
+         $sth->finish();
+      }
+   }
+   printf "\n";
+}
+
+
+   # Use the PartitionName and Nodes= list to asign owners to nodes
+
+foreach $line ( `cat $slurm_conf` ) {
+   chomp( $line );
+   next if $line =~ "PartitionName=osg.q";
+   next if $line =~ "PartitionName=batch.q";
+   next if $line =~ "PartitionName=killable.q";
+
+   if ( $line =~ "PartitionName=" ) {
+      $line =~ /PartitionName=([\-\.\w]+) /;
+      $partitionname = $1;
+      $line =~ /Nodes=([,\w]+) /;
+      @nodes = split(',', $1 );
+      foreach $node ( @nodes ) {
+         $owner{$node} = $partitionname;
+      }
+      #printf "partition $partitionname\n";
+   }
+}
+
+
+   # Get Host HW info NodeName, cores, memory, tmp
+
+foreach $line ( `cat $slurm_conf` ) {
+   chomp( $line );
+
+   if ( $line =~ "NodeName=" ) {
+      $gpu_type = "nogpu";
+      $ngpus = 0;
+      $line =~ /NodeName=(\w+) /;
+      $nodename = $1;
+      if ( $owner{$nodename} eq "" ) {
+         $owner{$nodename} = "unowned";
+      }
+      if ( $line =~ /CPUs=(\d+) / ) {
+         $cpus = $1;
+      }
+      if ( $line =~ /RealMemory=(\d+) / ) {
+         $memory = $1;
+      }
+      if ( $line =~ /TmpDisk=(\d+) / ) {
+         $tmp = $1;
+      }
+      if ( $line =~ /gpu:([\w_\d]+):(\d+)/ ) {
+         $gpu_type = $1;
+         $ngpus = $2;
+      }
+
+      if ( $operation =~ "restart" ) {    # If restart insert host and GPU data
+
+         &insert_into_table( $nodename, $cpus, $memory, $owner{$nodename}, $ngpus, $gpu_type, $tmp, $date );
+
+      } else {    # If rescan check for host entry and only update data and GPU data
+
+         $sth = $dbh->prepare("SELECT node_name FROM nodes WHERE node_name=\'$nodename\'");
+         $sth->execute() or die $DBI::errstr;
+         @row = $sth->fetchrow_array;
+         $nmatches = @row;
+         $sth->finish();
+
+         if ( $nmatches eq 0 ) {   # No matching host, do an insert
+
+            &insert_into_table( $nodename, $cpus, $memory, $owner{$nodename}, $ngpus, $gpu_type, $tmp, $date );
+
+         } else {                  # Host exists, do an update
+
+            &update_table_entry( $nodename, $cpus, $memory, $owner{$nodename}, $ngpus, $gpu_type, $tmp, $date );
+
+         }
+      }
+   }
+}
+
+exit(0);
+
+printf "Print data for Dwarf38\n";
+
+$sth = $dbh->prepare( "SELECT * FROM nodes WHERE node_name='dwarf38'" );
+$sth->execute();
+
+while ( @row = $sth->fetchrow_array ) {
+   printf "@row\n";
+   printf "$row[0]\n";
+   printf "$row[1]\n"; 
+   printf "$row[2]\n"; 
+}
+
+
+
+
+
+
+

@@ -1,0 +1,224 @@
+#!/usr/bin/perl
+# kstat is being developed by Dave Turner at Kansas State University
+# Fall 2014 - current  Email: DrDaveTurner@gmail.com
+# This is free software distributed under the GPLv3 license
+
+# kstat.convert will convert between SGE batch scripts and Slurm
+# kstat.convert --help      for a summary of how to use kstat.convert
+
+
+# Usage statement
+
+if( $ARGV[0] =~ "help" || $ARGV[0] =~ "usage" ) {
+   printf "USAGE: kstat.convert --sge sge.qsub.script --slurm slurm.sbatch.script\n";
+   exit;
+}
+
+   # Get the SGE and Slurm script names, and the direction to translate
+
+while( $#ARGV > -1 ) {
+   if( $ARGV[0] =~ "--sge" ){ 
+      $sge_script = $ARGV[1];
+      if( ! $slurm_script ) { $sge_to_slurm = "true"; }
+      shift; shift;
+   } elsif( $ARGV[0] =~ "--slurm" ) {
+      $slurm_script = $ARGV[1];
+      if( ! $sge_script ) { $slurm_to_sge = "true"; }
+      shift; shift;
+   } else {
+      printf "Cannot recognize the parameter $ARGV[0]\n";
+      exit(0);
+   }
+}
+
+
+if( $sge_to_slurm =~ "true" ) {       # Convert SGE batch file to Slurm
+
+   open( SGE, "< $sge_script" )
+      or die "Could not open SGE script |$sge_script| for input\n";
+
+   open( SLURM, "> $slurm_script" )
+      or die "Could not open Slurm script |$slurm_script| for output\n";
+   `chmod u+x $slurm_script`;
+
+   foreach $line ( <SGE> ) {
+
+      if( $line =~ /^#!/ && $line =~ 'bash' && $line !~ ' -l' ) {   # -l for login shell
+         chomp( $line );
+         $line .= " -l\n";
+      }   # else pass through csh and sh for now
+
+      if( $line =~ '^#\$ ' ) {     # Handle conversions of SGE to Slurm commands
+
+#printf "line = |$line|\n";
+         $line =~ s/#\$ +/#SBATCH /;
+
+         if( $line =~ '-binding' ) {
+            chomp($line);
+            $line = '#' . $line . "    NOTE: not sure how to translate binding yet\n";
+         }
+         $line =~ s/ -N +/ --job-name=/;     # Job name
+         $line =~ s/ -r +y/ --requeue/;
+         $line =~ s/ -r +n/ --no-requeue/;
+         next if( $line =~ ' -cwd' );        # cwd is default in slurm
+         next if( $line =~ ' -P ');          # We're not using project names for Slurm
+         next if( $line =~ ' -S ');          # Slurm doesn't define the shell this way
+         $line =~ s/ -wd +/ --workdir=/;
+         $line =~ s/ -A +/ --acccount=/;
+         $line =~ s/ -V/ --export=ALL/;
+
+         $line =~ s/ -hold_jid +/ --depend=afterok:/; # Hold until jid has completed
+
+         $line =~ s/ -M[ ]+/ --mail-user=/;
+         $line =~ s/ -m[ ]+[abe]+/ --mail-type=ALL   # same as =BEGIN,FAIL,END/;
+
+            # For array jobs, change -t to --array= and sub the : to - for the range
+            # but leave the second : for step size.   -t 0:10:2 --> --array=0-10:2
+
+         $line =~ s/ -t +/ --array=/;
+         if( $line =~ ' --array=' ) { $line =~ s/:/-/; }  # first : only for range
+
+            # -o stdout.file and -e stderr.file are passed through automatically
+            # Slurm will combine both unless a -e file is specified
+
+         next if( $line =~ " -j +[yn]" );   # Automatically joined unless -e used
+
+         $line =~ s/ -pe +single +/ --nodes=1\n#SBATCH --ntasks-per-node=/;   # Core count on one node
+
+            # Handle all -pe variations
+
+         if( $line =~ ' -pe ' ) { $line =~ s/\|/-/g; }  # Can only handle 1 OR pipe
+         $line =~ s/ -pe +mpi-fill +/ --spread-job --ntasks=/;
+         $line =~ s/ -pe +mpi-spread +/ --spread-job --ntasks=/;
+
+         if( $line =~ ' -pe ' && $line =~ ' mpi-' ) {
+            ($cores_per_node, $ncores) = ( $line =~ / -pe mpi-(\d+) +(\d+)/ );
+            $nnodes = $ncores / $cores_per_node;
+            printf SLURM "#SBATCH --nodes=$nnodes\n";
+            printf SLURM "#SBATCH --ntasks-per-node=$cores_per_node\n";
+            next;
+         }
+
+            # Convert queue groups to queues
+
+         if( $line =~ ' -q ' && $line =~ '@@' ) {
+            ($queue) = ( $line =~ /@@([^ \$]+)/ );
+            chomp( $queue );
+            $line = "#SBATCH -C " . $queue . "\n";
+         } elsif( $line =~ ' -q ' ) {  # Have user change regex to nodelist
+            $line =~ s/ -q [^@]+@/ --nodelist=/;
+            chomp( $line );
+            $line .= " # NOTE - convert any regex to a list like =host1,host[3-5,7]\n";
+         }
+
+
+            # Handle multiple -l parameters on the same line
+
+         if( $line =~ ' -l ' ) {
+
+               # Handle -l h_rt=dd:hh:ss to -t dd:hh:ss
+
+            if( $line =~ 'h_rt=' ) {
+               $d = 0;
+               ($h, $m, $s) = ($line =~ /h_rt=([0-9]+):([0-9]+):([0-9]+)/);
+               if( ! $s ) { ($m, $s) = ($line =~ /h_rt=([0-9]+):([0-9]+)/); }
+               if( ! $s ) { ($s)     = ($line =~          /h_rt=([0-9]+)/); }
+
+               if( $s > 60 ) {
+                  $m += int( $s / 60 );
+                  $s -= int( $s / 60 ) * 60;
+               }
+               if( length( $s ) == 0 ) { $s = '00'; }
+               if( length( $s ) == 1 ) { $s = '0' . $s; }
+
+               if( $m > 60 ) {
+                  $h += int( $m / 60 );
+                  $m -= int( $m / 60 ) * 60;
+               }
+               if( length( $m ) == 0 ) { $m = '00'; }
+               if( length( $m ) == 1 ) { $m = '0' . $m; }
+
+               if( $h > 24 ) {
+                  $d += int( $h / 24 );
+                  $h -= int( $h / 24 ) * 24;
+               }
+               if( length( $h ) == 0 ) { $h = '00'; }
+
+               if( $d > 0 ) { 
+                  if( length( $h ) == 1 ) { $h = '0' . $h; }
+                  $h = $d . '-' . $h;
+               }
+
+               #printf "d=|$d| h=|$h| m=|$m| s=|$s|\n";
+               #printf "time is |$h:$m:$s|\n";
+
+               #($time) = ($line =~ /h_rt=([0-9:]+)/ );
+               #if( $time !~ ':' ) { $time = "0:0:" . $time; } 
+               $time = "$h:$m:$s";
+               printf SLURM "#SBATCH --time=$time   # Use the form DD-HH:MM:SS\n";
+
+               if( $d == 0 or $d == 1 && $h == '00' ) {   # 24 hours or less
+                  printf SLURM "#SBATCH --partition=killable.q" .
+                               "   # Job may run as killable on owned nodes\n";
+               }
+            }
+
+            if( $line =~ 'mem=' ) {
+               ($memory) = ($line =~ /mem=(\d+[KMGT])/);
+               printf SLURM "#SBATCH --mem-per-cpu=$memory" .
+                      "   # Memory per core, use --mem= for memory per node\n";
+            }
+
+            if( $line =~ 'exclusive' ) {
+               printf SLURM "#SBATCH --exclusive\n";
+            }
+
+            if( $line =~ 'cuda=' ) {
+               ($cuda) = ($line =~ /cuda=(\d+)/);
+               printf SLURM "#SBATCH --gres=gpu:$cuda\n";
+            }
+
+            if( $line =~ '[^o]killable' ) {
+               printf SLURM "#SBATCH --partition=killable.q\n";
+            }   # ignore nokillable
+
+            if( $line =~ 'license=' ) {
+               ($license_count) = ($line =~ /license=(\d+)/);
+               printf SLURM "#SBATCH --licenses=$license_count\n";
+            }
+
+            if( $line =~ 'cpu_flags=' ) {
+               ($cpu_flags) = ($line =~ /cpu_flags=[*\/]*([a-zA-Z0-9]+)[*\/]*/);
+               printf SLURM "#SBATCH --contraint=$cpu_flags\n";
+            }
+
+            next;
+         }
+
+      } 
+
+         # Convert environmental variables for all lines
+
+      $line =~ s/\$JOB_ID/\$SLURM_JOB_ID/g;
+      $line =~ s/\$NSLOTS/\$SLURM_NPROCS/g;
+      $line =~ s/\$SGE_O_WORKDIR/\$SLURM_SUBMIT_DIR/g;
+      $line =~ s/\$SGE_O_HOST/\$SLURM_SUBMIT_HOST/g;
+      $line =~ s/\$PE_HOSTFILE/\$SLURM_JOB_NODELIST/g;
+      $line =~ s/\$SGE_TASK_ID/\$SLURM_ARRAY_TASK_ID/g;
+
+
+         # Now we output the modified line
+
+      printf SLURM $line;
+
+   }
+   close SGE;
+   close SLURM;
+
+} else {                              # Convert Slurm batch file to SGE
+
+   printf "I have not done the Slurm to SGE conversion yet\n";
+   exit(0);
+
+}
+
