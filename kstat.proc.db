@@ -10,38 +10,56 @@
 #    database then sleeping for 60 seconds on each compute node to
 #    gather information from the /proc system on memory, IO, and network
 #    usage for the host and each job.  This information is put into
-#    the kstat_info PostgreSQL database where kstat.db will use it.
-
-    ########################## CONFIGURATION ################################
-    ########################## CONFIGURATION ################################
-        # Edit to configure paths for your cluster computing system
-
-# Installation path
-#$installation_path = "/homes/daveturner/bin";
-
-# Slurm base path for slurm.conf and topology.conf files
-$slurm_path = "/etc/slurm";
-
-# SuperComputer name and optional computing center name
-#$system_name = "Beocat";
-#$center_name = "K-State";
-
-# Path to Perl library with PostgreSQL DB installed and DB host system
-$perl_lib = "/homes/daveturner/.perl5/lib/perl5/site_perl/5.34.1";
-$db_host = "ganymede.beocat.ksu.edu";
-
-# Open Science Grid user name on this system if any, or put "none"
-#$osg_user_name = "none";
-#$show_osg_jobs = "no";
-
-    ########################## END CONFIGURATION ################################
-    ########################## END CONFIGURATION ################################
+#    the kstat_info PostgreSQL database where kstat.db will retrieve it.
 
 no strict 'vars';   # Yell all you want, it's a preference thing.
 use Time::Piece;
 use Time::Seconds;
-use lib $perl_lib;
+#use lib $perl_lib;
 use DBI;
+
+   # Process the kstat.config file
+
+open( CONFIG, "./kstat.config" )
+   or die "Could not open the ./kstat.config file\n";
+
+foreach $line ( <CONFIG> ) {
+
+   chomp( $line );
+   next if( $line =~ "^ *#" );   # Skip comments with leading '#' sign
+   next if( $line !~ "=" );      # Skip lines without an '=' sign
+
+   if( $line =~ "install_path" ) {
+      ($install_path ) = ($line =~  /^ *install_path *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "slurm_path" ) {
+      ($slurm_path   ) = ($line =~    /^ *slurm_path *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "system_name" ) {    # Not used in kstat.proc.db
+      ($system_name  ) = ($line =~   /^ *system_name *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "center_name" ) {    # Not used in kstat.proc.db
+      ($center_name  ) = ($line =~   /^ *center_name *=[ "']*([^#]+)[ "']*/);
+   #} elsif( $line =~ "perl_lib" ) {
+      #($perl_lib     ) = ($line =~      /^ *perl_lib *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "db_name" ) {
+      ($db_name      ) = ($line =~       /^ *db_name *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "db_host" ) {
+      ($db_host      ) = ($line =~       /^ *db_host *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "db_password" ) {
+      ($db_password  ) = ($line =~   /^ *db_password *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "master_node" ) {
+      ($master_node  ) = ($line =~   /^ *master_node *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "osg_user_name" ) {    # Not used in kstat.proc.db
+      ($osg_user_name) = ($line =~ /^ *osg_user_name *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "osg_show_jobs" ) {    # Not used in kstat.proc.db
+      ($osg_show_jobs) = ($line =~ /^ *osg_show_jobs *=[ "']*([^#]+)[ "']*/);
+
+         # Grab owner names for each partition for Condo model
+
+   } elsif( $line =~ "condo" ) {   # Not used in kstat.proc.db
+      ($partition, $owner_name) = ($line =~ /^ *condo[ "']+([^ =]+)[ "']*=[ "']*([^#]+)[ "']*$/);
+      $hostowner{$partition} = "$owner_name";
+   }
+}
+$sconfile = "$install_directory/node.logs/kstat.scontrol.show.nodes.all";
 
    # Determine what OS we are on, tested on CentOS and Rocky
 
@@ -59,11 +77,9 @@ while ( $ostype eq "" ) {
 
 }
 
-$sconfile = "/opt/beocat/kstat-nodeinfo/kstat.scontrol.show.nodes";
-
    # Connect to the kstat_info PostgreSQL database
 
-$dbh = DBI->connect("dbi:Pg:dbname=kstat_info;host=$db_host",'kstat','rigid-headway-fountain',{AutoCommit=>1,RaiseError=>1,PrintError=>0});
+$dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host",'kstat',"$db_password",{AutoCommit=>1,RaiseError=>1,PrintError=>0});
 
 
    # Get the node_id for my hostname if there is one in the database already
@@ -225,6 +241,7 @@ foreach $line ( `cat $slurm_path/slurm.conf` ) {
    # Start the infinite loop, sleep until top of the minute at the end
 
 $prevdate = "None";
+$last_epoch = 0;
 while(1) {
 
    $timepiece = Time::Piece->new;
@@ -339,6 +356,19 @@ while(1) {
 
       foreach $line ( `cat $sconfile` ) {
 
+         if( $line =~ "epoch_seconds=" ) {
+            ($scepoch) = ($line =~ /epoch_seconds=(\d+)/);
+            $t = localtime;
+            $epoch = $t->epoch;
+            if ( $scepoch eq $last_epoch ) {
+               $secs = $epoch - $scepoch;
+               printf " ERROR - $sconfile epoch $scepoch already used $secs seconds ago\n";
+               last;
+            } else {
+               $last_epoch = $scepoch;
+            }
+         }
+
          if( $line =~ "NodeName=" ) {
             ($scnode) = ($line =~ /NodeName=(\w+)/);
          }
@@ -359,7 +389,7 @@ while(1) {
       }
 
    } else {
-      printf "ERROR - Could not open $sconfile";
+      printf "ERROR - Could not open $sconfile\n";
    }
 
       # Use scontrol to get host stats
@@ -530,11 +560,15 @@ while(1) {
       # DDT - Temp workaround, master node Wizard23 will do scontrol for all
       #       at the 30 second mark.  All nodes will read at the top of the minute.
 
-   if ( $nodename =~ "wizard23" ) {
-      sleep( 30 - `date '+%S'`);   # Sleep until the half minute
-      `scontrol show nodes > $sconfile.new`;
+   if ( $nodename =~ "$master_node" ) {  # Master is set in kstat.config
+      $t = localtime;
+      $epoch = $t->epoch;
+      $halfmin = 30 - $t->sec;
+      sleep( $halfmin );   # Sleep until the half minute
+      `echo "epoch_seconds=$epoch" > $sconfile.new`;
+      `scontrol show nodes >> $sconfile.new`;
       `mv $sconfile.new $sconfile`;
-      printf "MASTER did scontrol for all\n";
+      printf "MASTER $master_node did scontrol show nodes for all and put in $sconfile\n";
    }
 
    sleep( 60 - `date '+%S'`);   # Sleep until the top of the minute

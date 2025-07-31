@@ -38,6 +38,8 @@ foreach $line ( <CONFIG> ) {
       ($db_host      ) = ($line =~       /^ *db_host *=[ "']*([^#]+)[ "']*/);
    } elsif( $line =~ "db_password" ) {
       ($db_password  ) = ($line =~   /^ *db_password *=[ "']*([^#]+)[ "']*/);
+   } elsif( $line =~ "master_node" ) {
+      ($master_node  ) = ($line =~   /^ *master_node *=[ "']*([^#]+)[ "']*/);
    } elsif( $line =~ "osg_user_name" ) {
       ($osg_user_name) = ($line =~ /^ *osg_user_name *=[ "']*([^#]+)[ "']*/);
    } elsif( $line =~ "osg_show_jobs" ) {
@@ -394,8 +396,8 @@ foreach $line ( <SLURMCONF> ) {
          ($threads  )       = ($line =~ /ThreadsPerCore=(\S+)/);
          #$ncores{$host} = $sockets * $corespersocket * $threads;
 
-         ($gb_total{$host}) = ($line =~ /RealMemory=(\S+)/);
-         $gb_total{$host} /= 1000;
+         #($gb_total{$host}) = ($line =~ /RealMemory=(\S+)/);
+         #$gb_total{$host} /= 1000;
 
          ($tmpdisk{$host} ) = ($line =~ /TmpDisk=(\S+)/);
 
@@ -622,10 +624,11 @@ sub get_db_info {
       if( scalar @row eq 0 ) {
          @row = @frow;
          $node_metrics_date{$host} = Time::Piece->strptime( $row[2], '%Y-%m-%d %H:%M:%S' );
-         $cores_used{$host} = $row[3];
-         $load{$host} = $row[4];    # comes from scontrol
-         $mem_used{$host}   = int(0.5+$row[9]);    # Slurm total - avail
-         $mem_alloc{$host} = int(0.5+$row[10]);    # Slurm allocated
+         #$cores_used{$host} = $row[3];
+            # Get these from internal scontrol call instead of DB
+         #$load{$host} = $row[4];
+         #$mem_used{$host}   = int(0.5+$row[9]);
+         #$mem_alloc{$host} = int(0.5+$row[10]);
       } elsif( scalar @baserow eq 0 ) {
          @baserow = @frow;
       }
@@ -1439,22 +1442,22 @@ foreach $line ( `scontrol show nodes` ) {
    if( $line =~ "CPUAlloc" ) {
       ($cores{$host})  = ($line =~ /CPUAlloc=(\d+)/);
       ($nc)  = ($line =~ /CPUTot=(\d+)/);
-      #($load{$host}) = ($line =~ /CPULoad=([.0-9]+)/);
+      ($load{$host}) = ($line =~ /CPULoad=([.0-9]+)/);  # Also available from DB
    }
 
    if( $line =~ "RealMemory" ) {
-      ($gb_total{$host}) = ($line =~ /RealMemory=(\d+)/);
-      ($gb_alloc{$host}) = ($line =~ /AllocMem=(\d+)/);
-      ($gb_free{$host})  = ($line =~ /FreeMem=(\d+)/);
-      $gb_total{$host} /= 1000.0;
-      $gb_alloc{$host} /= 1000.0;
-      $gb_free{$host}  /= 1000.0;
+      ($mem_total{$host}) = ($line =~ /RealMemory=(\d+)/);
+      ($mem_alloc{$host}) = ($line =~ /AllocMem=(\d+)/);
+      ($mem_free{$host})  = ($line =~ /FreeMem=(\d+)/);
+      $mem_total{$host} /= 1000.0;
+      $mem_alloc{$host} /= 1000.0;
+      $mem_free{$host}  /= 1000.0;
 
-      if( $gb_free{$host} ) {
-         $gb = int( 10.0 * ($gb_total{$host} - $gb_free{$host}) + 0.5) / 10.0;
-         $gb_used{$host} = sprintf( "%6.1f", $gb);
+      if( $mem_free{$host} ) {
+         $gb = int( 10.0 * ($mem_total{$host} - $mem_free{$host}) + 0.5) / 10.0;
+         $mem_used{$host} = sprintf( "%6.1f", $gb);
       } else {
-         $gb_used{$host} = "    ??";
+         $mem_used{$host} = "    ??";
       }
    }
 
@@ -1845,10 +1848,14 @@ foreach $host ( @hostlist ) {
       } else {       # Print the host memory usage
 
          $color = $reset;
-         if ( not exists( $node_metrics_date{$host} ) ) {   # No data in 5 minutes
+         if ( not exists( $node_metrics_date{$host} ) ) {   # No data in last few minutes
             printf "${onorange}kstat.proc.db down$reset";
          } else {
-            printf "%s%4d/%4d/%4d GB%s ", $mem_color{$host}, 
+            $color = $reset;
+            $percent = $mem_alloc{$host} / $mem_total{$host};
+            if( $percent > 0.75 ) { $color = $yellow; }
+            if( $percent > 0.90 ) { $color = $red; }
+            printf "%s%4d/%4d/%4d GB%s ", $color,
                   $mem_used{$host}, $mem_alloc{$host}, $mem_total{$host}, $reset;
          }
 

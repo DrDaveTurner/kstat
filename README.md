@@ -46,6 +46,11 @@ exported to _PERL5LIB_ in the __kstat__ wrapper and __kstat.proc.db.sh__ startup
 Edit __kstat.config__ to define your setup.  If your system
 uses the condo model, you can specify condo partition name and owner name
 pairs.
+Choose one compute node to act as the __master node__ which will do the
+_scontrol show nodes_ on the half minute and put the data into a file for 
+all other nodes to read.  If the master node goes down it
+only affects some entries when using _kstat --table_ so it isn't a big deal.
+You can change the master node in the kstat.config file on the fly.
 
 Set up the PostgreSQL database then initiate it with 
 the __kstat_info.qsl__ file with a command like:
@@ -240,6 +245,9 @@ your head node.
 
 Known Issues
 ------------
+
+kstat.proc.db has only been tested on Rocky and CentOS Linux.
+Paths may need to be adjusted for other Linux flavors.
 
 This code is only being used on a few HPC systems at this time.
 If you want to try it out, please provide feedback on the installation
