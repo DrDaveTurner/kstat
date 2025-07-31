@@ -1,7 +1,7 @@
                      kstat - Slurm-based cluster  monitoring tool
 
-__kstat__ is being developed by __Dave Turner__ at __Kansas State University__
-Fall 2014 - present  Email: __DaveTurner@ksu.edu__.
+__kstat__ is being developed by __Dave Turner__ (DaveTurner@ksu.edu) 
+at __Kansas State University__ Fall 2014 - present.
 This is free software distributed under the GPLv3 license
 
 __kstat.proc.db__ is a Perl script that runs on each compute node collecting data
@@ -31,7 +31,7 @@ optionally gnuplot.  This wrapper then calls __kstat.db__ which is a Perl script
 requires modules Time::Piece and ANSIColor 4 which most Perl versions should now 
 include internally, but otherwise you'll need to install them using cpan.
 You will need to install the DBI and DBD::Pg Perl modules, and optionally 
-Chart::Gnuplot if you want to make graphs instead of just tables.  
+Chart::Gnuplot if you want to make graphs instead of just tables.
 All of these should be installed in a local library then the path should be 
 exported to _PERL5LIB_ in the __kstat__ wrapper and __kstat.proc.db.sh__ startup script.
 
@@ -261,5 +261,5 @@ Notes
 
   [PEARC'19 paper](./papers/Pearc-2019.pdf) mentioning kstat at the end
 
-This README.md file is from https://gitlab.beocat.ksu.edu/Admin-Public/kstat.git
+This README.md file is from https://github.com/DrDaveTurner/kstat
 

@@ -11,8 +11,12 @@ no strict 'vars';   # Yell all you want, it's a preference thing.
 use DBI;
 
 $operation = $ARGV[0];
+$db_name =
+$db_host =
+$db_password =
 
-$dbh = DBI->connect('dbi:Pg:dbname=kstat_info;host=ganymede.beocat.ksu.edu','kstat','rigid-headway-fountain',{AutoCommit=>1,RaiseError=>1,PrintError=>0});
+$dbh = DBI->connect("dbi:Pg:dbname=$db_name;host=$db_host",'kstat',"$db_password",{AutoCommit=>1,RaiseError=>1,PrintError=>0});
+
 
 
 #$sth = $dbh->prepare("ALTER TABLE node_metrics ADD cpu_load real");
