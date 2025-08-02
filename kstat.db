@@ -10,11 +10,20 @@
 # kstat --help     for a summary of how to use kstat
 # For use outside of KSU you may configure the hostcolor subroutine for your system
 
+no strict 'vars';  # Yell all you want, it's a preference thing.
+# Perl newer than 5.17.8 should have 256 colors and Time::Piece
+use Time::Piece;
+use Time::Seconds;
+use DBI;
+use Chart::Gnuplot;    # Only needed to support graphs
+use File::Basename;
+
+$script_dir = dirname( __FILE__ );
 
    # Process the kstat.config file
 
-open( CONFIG, "./kstat.config" )
-   or die "Could not open the ./kstat.config file\n";
+open( CONFIG, "$script_dir/kstat.config" )
+   or die "Could not open the $script_dir/kstat.config file\n";
 
 foreach $line ( <CONFIG> ) {
 
@@ -22,16 +31,12 @@ foreach $line ( <CONFIG> ) {
    next if( $line =~ "^ *#" );   # Skip comments with leading '#' sign
    next if( $line !~ "=" );      # Skip lines without an '=' sign
 
-   if( $line =~ "install_path" ) {
-      ($install_path ) = ($line =~  /^ *install_path *=[ "']*([^#]+)[ "']*/);
-   } elsif( $line =~ "slurm_path" ) {
+   if( $line =~ "slurm_path" ) {
       ($slurm_path   ) = ($line =~    /^ *slurm_path *=[ "']*([^#]+)[ "']*/);
    } elsif( $line =~ "system_name" ) {
       ($system_name  ) = ($line =~   /^ *system_name *=[ "']*([^#]+)[ "']*/);
    } elsif( $line =~ "center_name" ) {
       ($center_name  ) = ($line =~   /^ *center_name *=[ "']*([^#]+)[ "']*/);
-   #} elsif( $line =~ "perl_lib" ) {
-      #($perl_lib     ) = ($line =~      /^ *perl_lib *=[ "']*([^#]+)[ "']*/);
    } elsif( $line =~ "db_name" ) {
       ($db_name      ) = ($line =~       /^ *db_name *=[ "']*([^#]+)[ "']*/);
    } elsif( $line =~ "db_host" ) {
@@ -52,15 +57,6 @@ foreach $line ( <CONFIG> ) {
       $hostowner{$partition} = "$owner_name";
    }
 }
-
-no strict 'vars';  # Yell all you want, it's a preference thing.
-# Perl newer than 5.17.8 should have 256 colors and Time::Piece
-#use lib "/homes/daveturner/kstat/test_install/perl_lib";  # Symbolic link to actual lib
-#use lib $perl_lib;   # Set and export PERL5LIB in the kstat wrapper
-use Time::Piece;
-use Time::Seconds;
-use DBI;
-use Chart::Gnuplot;    # Only needed to support graphs
 
 
    # Connect to the kstat_info PostgreSQL database
@@ -417,6 +413,11 @@ foreach $line ( <SLURMCONF> ) {
          if( $gbps ) { $llist{$host} .= "$green$gbps Gbps OmniPath$reset  "; }
          ( $gbps ) = ($line =~ /fabric:iwarp:[a-zA-Z_]+:([0-9]+)/);
          if( $gbps ) { $llist{$host} .= "$green$gbps Gbps iWarp$reset  "; }
+         ( $gbps ) = ($line =~ /fabric:eth:[a-zA-Z_]+:([0-9]+)/);
+         if( $gbps and $line !~ "fabric:roce" and $line !~ "fabric:ib" and
+                       $line !~ "fabric:opa" and $line !~ "fabric:iwarp" ) { 
+            $llist{$host} .= "$green$gbps Gbps Ethernet$reset  ";
+         }
          #if( $line =~ /avx[^2]/ ) { $llist{$host} .= "${blue}AVX$reset  "; }
          #if( $line =~ /avx2/ ) {    $llist{$host} .= "${blue}AVX2$reset  "; }
          #if( $line =~ /knl/ ) {     $llist{$host} .= "${blue}KNL$reset  "; }
@@ -627,7 +628,7 @@ sub get_db_info {
          #$cores_used{$host} = $row[3];
             # Get these from internal scontrol call instead of DB
          #$load{$host} = $row[4];
-         #$mem_used{$host}   = int(0.5+$row[9]);
+         $mem_used{$host}   = int(0.5+$row[9]);  # Comes from /proc/meminfo
          #$mem_alloc{$host} = int(0.5+$row[10]);
       } elsif( scalar @baserow eq 0 ) {
          @baserow = @frow;
@@ -1448,17 +1449,17 @@ foreach $line ( `scontrol show nodes` ) {
    if( $line =~ "RealMemory" ) {
       ($mem_total{$host}) = ($line =~ /RealMemory=(\d+)/);
       ($mem_alloc{$host}) = ($line =~ /AllocMem=(\d+)/);
-      ($mem_free{$host})  = ($line =~ /FreeMem=(\d+)/);
-      $mem_total{$host} /= 1000.0;
-      $mem_alloc{$host} /= 1000.0;
-      $mem_free{$host}  /= 1000.0;
+      #($mem_free{$host})  = ($line =~ /FreeMem=(\d+)/);
+      $mem_total{$host} /= 1024.0;
+      $mem_alloc{$host} /= 1024.0;
+      #$mem_free{$host}  /= 1024.0;
 
-      if( $mem_free{$host} ) {
-         $gb = int( 10.0 * ($mem_total{$host} - $mem_free{$host}) + 0.5) / 10.0;
-         $mem_used{$host} = sprintf( "%6.1f", $gb);
-      } else {
-         $mem_used{$host} = "    ??";
-      }
+      #if( $mem_free{$host} ) {
+         #$gb = int( 10.0 * ($mem_total{$host} - $mem_free{$host}) + 0.5) / 10.0;
+         #$mem_used{$host} = sprintf( "%6.1f", $gb);
+      #} else {
+         #$mem_used{$host} = "    ??";
+      #}
    }
 
    ($state) = ($line =~ /State=(\S+)/);
@@ -1853,8 +1854,8 @@ foreach $host ( @hostlist ) {
          } else {
             $color = $reset;
             $percent = $mem_alloc{$host} / $mem_total{$host};
-            if( $percent > 0.75 ) { $color = $yellow; }
-            if( $percent > 0.90 ) { $color = $red; }
+            #if( $percent > 0.75 ) { $color = $yellow; }
+            if( $percent > 0.90 ) { $color = $yellow; }
             printf "%s%4d/%4d/%4d GB%s ", $color,
                   $mem_used{$host}, $mem_alloc{$host}, $mem_total{$host}, $reset;
          }

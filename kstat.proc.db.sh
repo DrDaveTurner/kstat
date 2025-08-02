@@ -7,7 +7,7 @@ module purge
 module load Perl/5.36.1-GCCcore-12.3.0
 module load PostgreSQL/16.1-GCCcore-12.3.0
 
-export PERL5LIB=/opt/beocat/kstat/perl5/
+export PERL5LIB=/opt/beocat/kstat/perl5/lib/perl5
 
 HOST=`hostname`
 

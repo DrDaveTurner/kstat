@@ -15,7 +15,6 @@
 no strict 'vars';   # Yell all you want, it's a preference thing.
 use Time::Piece;
 use Time::Seconds;
-#use lib $perl_lib;
 use DBI;
 
    # Process the kstat.config file
@@ -29,16 +28,12 @@ foreach $line ( <CONFIG> ) {
    next if( $line =~ "^ *#" );   # Skip comments with leading '#' sign
    next if( $line !~ "=" );      # Skip lines without an '=' sign
 
-   if( $line =~ "install_path" ) {
-      ($install_path ) = ($line =~  /^ *install_path *=[ "']*([^#]+)[ "']*/);
-   } elsif( $line =~ "slurm_path" ) {
+   if( $line =~ "slurm_path" ) {
       ($slurm_path   ) = ($line =~    /^ *slurm_path *=[ "']*([^#]+)[ "']*/);
    } elsif( $line =~ "system_name" ) {    # Not used in kstat.proc.db
       ($system_name  ) = ($line =~   /^ *system_name *=[ "']*([^#]+)[ "']*/);
    } elsif( $line =~ "center_name" ) {    # Not used in kstat.proc.db
       ($center_name  ) = ($line =~   /^ *center_name *=[ "']*([^#]+)[ "']*/);
-   #} elsif( $line =~ "perl_lib" ) {
-      #($perl_lib     ) = ($line =~      /^ *perl_lib *=[ "']*([^#]+)[ "']*/);
    } elsif( $line =~ "db_name" ) {
       ($db_name      ) = ($line =~       /^ *db_name *=[ "']*([^#]+)[ "']*/);
    } elsif( $line =~ "db_host" ) {
@@ -61,7 +56,7 @@ foreach $line ( <CONFIG> ) {
 }
 $sconfile = "$install_directory/node.logs/kstat.scontrol.show.nodes.all";
 
-   # Determine what OS we are on, tested on CentOS and Rocky
+   # Determine what OS we are on, currently only tested on CentOS and Rocky
 
 $ostype = "";
 while ( $ostype eq "" ) {
@@ -72,7 +67,7 @@ while ( $ostype eq "" ) {
       $ostype = "CentOS";
    } else {
       printf "ERROR: Could not determine the OS type, not CentOS or Rocky\n";
-      sleep( 60 - `date '+%S'`);   # Sleep until the top of the minute
+      sleep( 600 - `date '+%S'`);   # Sleep for 10 minutes, maybe Slurm is not up
    }
 
 }
