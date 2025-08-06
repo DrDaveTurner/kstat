@@ -16,11 +16,14 @@ no strict 'vars';   # Yell all you want, it's a preference thing.
 use Time::Piece;
 use Time::Seconds;
 use DBI;
+use File::Basename;
+
+$script_dir = dirname( __FILE__ );
 
    # Process the kstat.config file
 
-open( CONFIG, "./kstat.config" )
-   or die "Could not open the ./kstat.config file\n";
+open( CONFIG, "$script_dir/kstat.config" )
+   or die "Could not open the $script_dir/kstat.config file\n";
 
 foreach $line ( <CONFIG> ) {
 
@@ -54,7 +57,7 @@ foreach $line ( <CONFIG> ) {
       $hostowner{$partition} = "$owner_name";
    }
 }
-$sconfile = "$install_directory/node.logs/kstat.scontrol.show.nodes.all";
+$sconfile = "$script_dir/node.logs/kstat.scontrol.show.nodes.all";
 
    # Determine what OS we are on, currently only tested on CentOS and Rocky
 
@@ -339,7 +342,7 @@ while(1) {
       $sth->finish();
    }
 
-      # DDT - Get scontrol info from the file the master created
+      # Get scontrol info from the file the master created
 
    $coresalloc = -1;
    $ncores = -1;

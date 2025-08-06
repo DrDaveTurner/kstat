@@ -443,7 +443,7 @@ foreach $line ( <SLURMCONF> ) {
 
 
 
-# Get hostnames from compressed list like Elf[12,13-15],Hero05 and return an array
+# Get hostnames from compressed list like hero[12,13-15],Hero05 and return an array
 # Can expand multiple brackets like c###-#[0-9][1-4] for Stampede2.
 
 sub get_hostnames {
@@ -1688,11 +1688,9 @@ if( $pr_cores ) {
 
 # Now print out the host and job information
 
-if( $system =~ "Beocat" ) {   # Sort nodes oldest to newest
+if( $system_name =~ "Beocat" ) {   # Sort nodes oldest to newest
    @hosts = @hostlist;
    @hostlist = ();
-   foreach $host ( sort @hosts ) { if( $host =~ "mage"   ) { push @hostlist, $host; }}
-   foreach $host ( sort @hosts ) { if( $host =~ "elf"    ) { push @hostlist, $host; }}
    foreach $host ( sort @hosts ) { if( $host =~ "hero"   ) { push @hostlist, $host; }}
    foreach $host ( sort @hosts ) { if( $host =~ "dwarf"  ) { push @hostlist, $host; }}
    foreach $host ( sort @hosts ) { if( $host =~ "mole"   ) { push @hostlist, $host; }}

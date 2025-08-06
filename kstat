@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/usr/bin/bash -l
 
 module purge
 module load Perl/5.36.1-GCCcore-12.3.0
